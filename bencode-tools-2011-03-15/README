@@ -1,0 +1,8 @@
+== bencode-tools ==
+
+bencode-tools is a collection of tools for manipulating bencoded data.
+See http://en.wikipedia.org/wiki/Bencode for information on bencode
+format.
+
+This was formely named 'typevalidator'. With the introduction of
+libbencodetools the project is named 'bencode-tools'.
