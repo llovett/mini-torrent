@@ -207,18 +207,16 @@ void write_block(char* data, int piece, int offset, int len, int acquire_lock) {
     }
     // single-file case
     else {
-
 	struct bencode_str* name = (struct bencode_str*)ben_dict_get_by_str(info,"name");
 	if(name) {
-	    FILE *outfile = fopen(name->s,"w+");
+	    int outfile = open(name->s,O_RDWR|O_CREAT,0777);
 	    file_length = ((struct bencode_int*)ben_dict_get_by_str(info,"length"))->ll;			
 	    if (debug) fprintf(stderr, "file %s, spot %d", name->s, piece*piece_length+offset);
 
 	    // write the data to the right spot in the file
-	    fseek(outfile,piece*piece_length+offset,SEEK_SET);
-	    fwrite(data,1,len,outfile);
-	    fclose(outfile);
-	
+	    lseek(outfile,piece*piece_length+offset,SEEK_SET);
+	    write(outfile,data,len);
+	    close(outfile);
 	}
 	else {
 	    printf("No name?\n");
@@ -591,11 +589,8 @@ void start_peers() {
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 1);
 
-	FILE *anno = fopen("/tmp/anno.tmp","w+");
-	if(!anno) {
-	    perror("couldn't create temporary file\n");
-	}
-
+	char *tmp_name = "/tmp/anno-llovett";
+	FILE *anno = fopen(tmp_name,"w+");
 	int attempts=0;
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, anno); 
 	while((res = curl_easy_perform(curl)) !=CURLE_OK && 
@@ -608,13 +603,14 @@ void start_peers() {
 
 	if (attempts<5) {
 	    struct stat anno_stat;
-	    if(stat("/tmp/anno.tmp",&anno_stat)) {
-		perror("couldn't stat /tmp/anno.tmp");
+	    if(stat(tmp_name,&anno_stat)) {
+		perror("couldn't stat temporary file");
 		exit(1);
 	    }
 	    // the announcement document is in /tmp/anno.tmp. 
 	    // so map that into memory, then call handle_announcement on the returned pointer
-	    handle_announcement(mmap(0,anno_stat.st_size,PROT_READ,MAP_SHARED,open("/tmp/anno.tmp",O_RDONLY),0),anno_stat.st_size);
+	    handle_announcement(mmap(0,anno_stat.st_size,PROT_READ,MAP_SHARED,open(tmp_name,O_RDONLY),0),
+				anno_stat.st_size);
 	}
 	curl_easy_cleanup(curl);
     }
