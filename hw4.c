@@ -18,6 +18,9 @@
 
 #include"hw4.h"
 
+// Read and write sets of peers
+fd_set readset, writeset;
+
 // computed in main(). This is where we get our peers from.
 char announce_url[255];
 
@@ -33,7 +36,8 @@ int debug=1;  //set this to zero if you don't want all the debugging messages
 char screenbuf[10000];
 
 void print_bencode(struct bencode*);
-void start_peers();
+struct peer_addr *start_peers(void);
+struct peer_addr *handle_announcement(char *ptr, size_t size);
 
 // The SHA1 digest of the document we're downloading this time. 
 // using a global means we can only ever download a single torrent in a single process. That's ok.
@@ -501,89 +505,13 @@ shutdown:
     return 0;
 }
 
-/* handle_announcement reads an announcement document to find some peers to download from.
-   start a new tread for each peer.
-*/
-void handle_announcement(char *ptr, size_t size) {
-    struct bencode* anno = ben_decode(ptr,size);
-
-    printf("Torrent has %lld seeds and %lld downloading peers. \n",
-	   ((struct bencode_int*)ben_dict_get_by_str(anno,"complete"))->ll,
-	   ((struct bencode_int*)ben_dict_get_by_str(anno,"incomplete"))->ll);
-		 
-    struct bencode_list *peers = (struct bencode_list*)ben_dict_get_by_str(anno,"peers");
-
-    /* unfortunately, the list of peers could be either in bencoded format, or in binary format. 
-       the binary format value is passed as a string, bencoded format is passed as a list. 
-       We handle the two cases separately below.
-
-       For each peer, we start a new thread to connect to the peer. Your solution is not allowed 
-       to use threads.
-    */
-    // handle the binary case
-    if(peers->type == BENCODE_STR) {
-	printf("Got binary list of peers\n");
-
-	// the "string" in peers is really a list of peer_addr structs, so we'll just cast it as such
-	struct peer_addr *peerlist = (struct peer_addr*)((struct bencode_str*)peers)->s;
-	for(int i=0;i<((struct bencode_str*)peers)->len/6;i++) {				
-	    struct in_addr a;
-	    a.s_addr = peerlist[i].addr;
-	    printf("Found peer %s:%d\n",inet_ntoa(a),ntohs(peerlist[i].port));				 
-
-	    pthread_t thread;
-	    pthread_create(&thread,0,connect_to_peer,&peerlist[i]);
-	}			 
-    }
-    // handle the bencoded case
-    else {
-	for(int i=0;i<peers->n;i++) {
-	    printf("Got bencoded list of peers\n");
-	    struct bencode *peer = peers->values[i];
-	    char *address = ((struct bencode_str*)ben_dict_get_by_str(peer,"ip"))->s;
-	    unsigned short port = ((struct bencode_int*)ben_dict_get_by_str(peer,"port"))->ll;
-	    printf("Found peer %s:%d\n",address,port);
-
-	    // pthread_create allows us to pass in one pointer. For the bencoded case, we allocate a new
-	    // peer_addr struct, and pass that in. Note that we can't allocate this on the stack, as it would
-	    // be immediately overwritten before the thread even got started. 
-
-	    struct peer_addr *peeraddr = malloc(sizeof(struct peer_addr));
-	    peeraddr->addr=inet_addr(address);
-	    peeraddr->port=htons(port);
-
-	    pthread_t thread;
-	    pthread_create(&thread,0,connect_to_peer,&peeraddr);
-	}
-    }
-	
-    // wait for a signal that all the downloading is done
-    while(missing_blocks()>0) {
-	pthread_mutex_lock(&status_lock);
-	pthread_cond_wait(&finish_cond,&status_lock);
-	fprintf(stderr,"One thread finished, %d active peers, %d missing blocks\n",active_peers(),missing_blocks());
-
-	if(active_peers()==0 && missing_blocks()>0) {
-	    printf("Ran out of active peers, reconnecting.\n");
-	    start_peers();
-	}
-
-	pthread_mutex_unlock(&status_lock);
-    }
-}
-
-/* contact the tracker to get announcement, call handle_announcement on the result */
-void start_peers() {
-    pthread_mutex_lock(&anno_lock);
-    /* now download the announcement document using libcurl. 
-       because of the way curl does things, it's easiest to just throw the entire document into a file first, 
-       and then just read the file. the alternative would be to buffer up all the data in memory using a
-       custom callback function. Let's stick with the KISS principle. 
-    */
+struct peer_addr *start_peers() {
+    // Contact the tracker and handle the announcement we receive
     CURL *curl;
     CURLcode res;
 
     curl = curl_easy_init();
+    struct peer_addr *peer_addr_list = NULL;
     if(curl) {
 	curl_easy_setopt(curl, CURLOPT_URL, announce_url);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 1);
@@ -608,14 +536,89 @@ void start_peers() {
 		perror("couldn't stat temporary file");
 		exit(1);
 	    }
-	    // the announcement document is in /tmp/anno.tmp. 
+	    // the announcement document is in <tmp_name>
 	    // so map that into memory, then call handle_announcement on the returned pointer
-	    handle_announcement(mmap(0,anno_stat.st_size,PROT_READ,MAP_SHARED,open(tmp_name,O_RDONLY),0),
-				anno_stat.st_size);
+	    peer_addr_list = handle_announcement(mmap(0,anno_stat.st_size,PROT_READ,MAP_SHARED,open(tmp_name,O_RDONLY),0),
+						 anno_stat.st_size);
 	}
 	curl_easy_cleanup(curl);
     }
-    pthread_mutex_unlock(&anno_lock);
+
+    return peer_addr_list;
+}
+
+/* handle_announcement reads an announcement document to find some peers to download from.
+   start a new tread for each peer.
+*/
+struct peer_addr *handle_announcement(char *ptr, size_t size) {
+    struct bencode* anno = ben_decode(ptr,size);
+
+    printf("Torrent has %lld seeds and %lld downloading peers. \n",
+	   ((struct bencode_int*)ben_dict_get_by_str(anno,"complete"))->ll,
+	   ((struct bencode_int*)ben_dict_get_by_str(anno,"incomplete"))->ll);
+		 
+    struct bencode_list *peer_addrs = (struct bencode_list*)ben_dict_get_by_str(anno,"peers");
+
+    /* unfortunately, the list of peers could be either in bencoded format, or in binary format. 
+       the binary format value is passed as a string, bencoded format is passed as a list. 
+       We handle the two cases separately below.
+
+       For each peer, we start a new thread to connect to the peer. Your solution is not allowed 
+       to use threads.
+    */
+    // handle the binary case
+    if(peer_addrs->type == BENCODE_STR) {
+	printf("Got binary list of peers\n");
+
+	// the "string" in peers is really a list of peer_addr structs, so we'll just cast it as such
+	struct peer_addr *peerlist = (struct peer_addr*)((struct bencode_str*)peer_addrs)->s;
+
+	for(int i=0;i<((struct bencode_str*)peer_addrs)->len/6;i++) {
+	    struct in_addr a;
+	    a.s_addr = peerlist[i].addr;
+	    printf("Found peer %s:%d\n",inet_ntoa(a),ntohs(peerlist[i].port));
+	    /* pthread_t thread; */
+	    /* pthread_create(&thread,0,connect_to_peer,&peerlist[i]); */
+	}
+
+	return peerlist;
+    }
+    // handle the bencoded case
+    else {
+	struct peer_addr *peerlist = (struct peer_addr*)malloc(sizeof(struct peer_addr)*(peer_addrs->n));
+	for(int i=0;i<peer_addrs->n;i++) {
+	    printf("Got bencoded list of peers\n");
+	    struct bencode *peer = peer_addrs->values[i];
+	    char *address = ((struct bencode_str*)ben_dict_get_by_str(peer,"ip"))->s;
+	    unsigned short port = ((struct bencode_int*)ben_dict_get_by_str(peer,"port"))->ll;
+	    printf("Found peer %s:%d\n",address,port);
+
+	    // pthread_create allows us to pass in one pointer. For the bencoded case, we allocate a new
+	    // peer_addr struct, and pass that in. Note that we can't allocate this on the stack, as it would
+	    // be immediately overwritten before the thread even got started. 
+
+	    peerlist[i].addr=inet_addr(address);
+	    peerlist[i].port=htons(port);
+
+	    /* pthread_t thread; */
+	    /* pthread_create(&thread,0,connect_to_peer,&peeraddr); */
+	}
+	return peerlist;
+    }
+	
+    /* // wait for a signal that all the downloading is done */
+    /* while(missing_blocks()>0) { */
+    /* 	pthread_mutex_lock(&status_lock); */
+    /* 	pthread_cond_wait(&finish_cond,&status_lock); */
+    /* 	fprintf(stderr,"One thread finished, %d active peers, %d missing blocks\n",active_peers(),missing_blocks()); */
+
+    /* 	if(active_peers()==0 && missing_blocks()>0) { */
+    /* 	    printf("Ran out of active peers, reconnecting.\n"); */
+    /* 	    start_peers(); */
+    /* 	} */
+
+    /* 	pthread_mutex_unlock(&status_lock); */
+    /* } */
 }
 
 int main(int argc, char** argv) {
@@ -702,6 +705,52 @@ int main(int argc, char** argv) {
     printf("Announce URL: %s\n",announce_url);
     fflush(stdout);
 
-    start_peers();
+    // Contact the tracker and get the list of peer addresses from that
+    struct peer_addr *peer_addr_list = start_peers();
+
+    /***************/
+    /* SELECT LOOP */
+    /***************/
+
+    // Select loop goes here
+    while (1) {
+	fd_set rtemp, wtemp;
+	/* FD_COPY(&readset, &rtemp); */
+	/* FD_COPY(&writeset, &wtemp); */
+
+	int selected = select(FD_SETSIZE, &rtemp, &wtemp, NULL, 0);
+
+	struct peer_state *peer = peers;
+	while (peer) {
+	    if (FD_ISSET(peer->socket, &rtemp)) {
+		if (!peer->connected) {
+		    //TODO:implement receive_handshake(peer struct*)
+		    /* receive_handshake(peer); */
+		} else {
+		    // handle the non-handshake message
+		    receive_message(peer);
+		}
+	    } else if (FD_ISSET(peer->socket, &wtemp)) {
+		// write message
+	    }
+	}
+
+	// wait for a signal that all the downloading is done
+	if (missing_blocks()>0) {
+	    pthread_mutex_lock(&status_lock);
+	    pthread_cond_wait(&finish_cond,&status_lock);
+	    fprintf(stderr,"One iteration finished, %d active peers, %d missing blocks\n",active_peers(),missing_blocks());
+
+	    if(active_peers()==0 && missing_blocks()>0) {
+		printf("Ran out of active peers, reconnecting.\n");
+		peer_addr_list = start_peers();
+
+		//TODO: construct peer states and such
+	    }
+
+	    pthread_mutex_unlock(&status_lock);
+	}
+    }
+
 }
 
