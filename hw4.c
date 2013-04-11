@@ -29,17 +29,17 @@ pthread_cond_t finish_cond;
 enum {PIECE_EMPTY=0, PIECE_PENDING=1, PIECE_FINISHED=2} *piece_status;
 
 #define BUFSIZE piece_length*2-1
-struct peer_state *peers=0;
+struct peer_state *peers=NULL;
 
-int debug=1;  //set this to zero if you don't want all the debugging messages 
+int debug=1;  //set this to zero if you don't want all the debugging messages
 
 char screenbuf[10000];
 
 void print_bencode(struct bencode*);
-struct peer_addr *start_peers(void);
-struct peer_addr *handle_announcement(char *ptr, size_t size);
+void start_peers(struct peer_addr**);
+void handle_announcement(char *ptr, size_t size);
 
-// The SHA1 digest of the document we're downloading this time. 
+// The SHA1 digest of the document we're downloading this time.
 // using a global means we can only ever download a single torrent in a single process. That's ok.
 unsigned char digest[20];
 
@@ -50,6 +50,15 @@ struct bencode *info;
 
 int file_length=0;
 int piece_length;
+
+void print_peer_address(struct peer_addr *addr) {
+    struct in_addr ipaddr;
+    ipaddr.s_addr = addr->addr;
+    printf("peer address: IP(%s) PORT(%hu)\n",
+	   inet_ntoa(ipaddr),
+	   addr->port);
+    fflush(stdout);
+}
 
 int active_peers() {
     struct peer_state *peer = peers;
@@ -80,7 +89,7 @@ int peer_connected(in_addr_t addr) {
 	    return 1;
 	}
 	peer = peer->next;
-    }	
+    }
     return 0;
 }
 
@@ -116,33 +125,33 @@ int missing_blocks() {
 
 /* so far, we're assuming that every peer actually have all pieces. That's not good! */
 int next_piece(int previous_piece) {
-    pthread_mutex_lock(&status_lock); 
+    pthread_mutex_lock(&status_lock);
     if(previous_piece!=-1)
 	piece_status[previous_piece]=PIECE_FINISHED;
-	
+
     draw_state();
 
     for(int i=0;i<(file_length/piece_length+1);i++) {
 	if(piece_status[i]==PIECE_EMPTY) {
 	    if(debug)
 		fprintf(stderr,"Next piece %d / %d\n",i,file_length/piece_length);
-	    piece_status[i]=PIECE_PENDING;			 
-	    pthread_mutex_unlock(&status_lock);	
+	    piece_status[i]=PIECE_PENDING;
+	    pthread_mutex_unlock(&status_lock);
 	    return i;
 	}
     }
-    pthread_mutex_unlock(&status_lock);	
+    pthread_mutex_unlock(&status_lock);
     return -1;
 }
 
-/* This needs to be fixed to work properly for multi-file torrents. 
-   specifically, it needs to create the proper directory structure, rather than just concatenate directory and file names. 
+/* This needs to be fixed to work properly for multi-file torrents.
+   specifically, it needs to create the proper directory structure, rather than just concatenate directory and file names.
 */
 void write_block(char* data, int piece, int offset, int len, int acquire_lock) {
     FILE *outfile;
 
     if(acquire_lock)
-	pthread_mutex_lock(&file_lock); 
+	pthread_mutex_lock(&file_lock);
 
     int accumulated_file_length = 0;
     int block_start = piece*piece_length+offset;
@@ -154,20 +163,20 @@ void write_block(char* data, int piece, int offset, int len, int acquire_lock) {
 	    struct bencode* file = files->values[i];
 	    struct bencode_list* path = (struct bencode_list*)ben_dict_get_by_str(file,"path");
 	    //			printf("Filename %s/%s\n",((struct bencode_str*)ben_dict_get_by_str(info,"name"))->s,((struct bencode_str*)path->values[0])->s);
-	    // accumulate a total length so we know how many pieces there are 
-	    int file_length=((struct bencode_int*)ben_dict_get_by_str(file,"length"))->ll; 
+	    // accumulate a total length so we know how many pieces there are
+	    int file_length=((struct bencode_int*)ben_dict_get_by_str(file,"length"))->ll;
 
 	    printf("start %d len %d accum %d filelen %d\n",block_start,len,accumulated_file_length,file_length);
 	    fflush(stdout);
 	    // at least part of the block belongs in this file
 	    if((block_start >= accumulated_file_length) && (block_start < accumulated_file_length+file_length)) {
 		char filename[255];
-				
+
 		mkdir(((struct bencode_str*)ben_dict_get_by_str(info,"name"))->s,0777);
 		chmod(((struct bencode_str*)ben_dict_get_by_str(info,"name"))->s,07777);
-				
+
 		sprintf(filename,"%s/",((struct bencode_str*)ben_dict_get_by_str(info,"name"))->s);
-		for(int j=0;j<path->n;j++) {					
+		for(int j=0;j<path->n;j++) {
 		    if(j<(path->n-1)) {
 			sprintf(filename+strlen(filename),"%s/",((struct bencode_str*)path->values[j])->s);
 			mkdir(filename,0777);
@@ -175,15 +184,15 @@ void write_block(char* data, int piece, int offset, int len, int acquire_lock) {
 		    }
 		    else
 			sprintf(filename+strlen(filename),"%s",((struct bencode_str*)path->values[j])->s);
-		}	
-				
+		}
+
 		int outfile = open(filename,O_RDWR|O_CREAT,0777);
 		if(outfile == -1) {
 		    fprintf(stderr,"filename: %s\n",filename);
 		    perror("Couldn't open file for writing");
 		    exit(1);
 		}
-				
+
 		int offset_into_file = block_start - accumulated_file_length;
 		int remaining_file_length = file_length - offset_into_file;
 		lseek(outfile,offset_into_file,SEEK_SET);
@@ -215,7 +224,7 @@ void write_block(char* data, int piece, int offset, int len, int acquire_lock) {
 	struct bencode_str* name = (struct bencode_str*)ben_dict_get_by_str(info,"name");
 	if(name) {
 	    int outfile = open(name->s,O_RDWR|O_CREAT,0777);
-	    file_length = ((struct bencode_int*)ben_dict_get_by_str(info,"length"))->ll;			
+	    file_length = ((struct bencode_int*)ben_dict_get_by_str(info,"length"))->ll;
 	    if (debug) fprintf(stderr, "file %s, spot %d", name->s, piece*piece_length+offset);
 
 	    // write the data to the right spot in the file
@@ -228,10 +237,10 @@ void write_block(char* data, int piece, int offset, int len, int acquire_lock) {
 	    exit(1);
 	}
     }
-	
+
 cleanup:
     if(acquire_lock)
-	pthread_mutex_unlock(&file_lock); 
+	pthread_mutex_unlock(&file_lock);
 }
 
 void shutdown_peer(struct peer_state *peer) {
@@ -239,26 +248,33 @@ void shutdown_peer(struct peer_state *peer) {
     peer->connected = 0;
 }
 
-// Wait for peer to send us a message (could be a partial message!)
+/* Wait for peer to send us a message (could be a partial message!)
+ * returns:
+ *	0 if no message or partial message
+ *	message length, if a full message is ready
+ **/
 int receive_message(struct peer_state* peer) {
     if (peer->count<4 || ntohl(((int*)peer->incoming)[0])+4 > peer->count) {
 	int newbytes=recv(peer->socket,peer->incoming+peer->count,BUFSIZE-peer->count,0);
-	if(newbytes == 0) {			
+	if(newbytes == 0) {
 	    fprintf(stderr,"Connection was closed by peer, count was %d, msg size %d\n",peer->count,ntohl(((int*)peer->incoming)[0]));
 	    return 0;
 	}
 	else if(newbytes < 0) {
-	    perror("Problem when receiving more bytes, closing socket.");
+	    perror("Problem when receiving more bytes, closing socket");
 	    close(peer->socket);
-	    peer->connected = 0;			
+	    peer->connected = 0;
 	    return 0;
 	}
 	peer->count+=newbytes;
-    }		 
+    }
+    if (peer->count<4 || ntohl(((int*)peer->incoming)[0])+4 > peer->count) {
+	return 0;
+    }
     return ntohl(((int*)peer->incoming)[0]);
 }
 
-// Drop the most recent message from the buffer. 
+// Drop the most recent message from the buffer.
 void drop_message(struct peer_state* peer) {
     int msglen = ntohl(((int*)peer->incoming)[0]); // size of length prefix is not part of the length
     if(peer->count<msglen+4) {
@@ -272,7 +288,7 @@ void drop_message(struct peer_state* peer) {
     }
 }
 
-void request_block(struct peer_state* peer, int piece, int offset) {	
+void request_block(struct peer_state* peer, int piece, int offset) {
 
     /* requests have the following format */
     struct {
@@ -284,10 +300,10 @@ void request_block(struct peer_state* peer, int piece, int offset) {
     } __attribute__((packed)) request;
 
     request.len=htonl(13);
-    request.id=6;	
+    request.id=6;
     request.index=htonl(piece);
     request.begin=htonl(offset);
-    request.length=htonl(1<<14);						
+    request.length=htonl(1<<14);
 
     // the last block is likely to be of non-standard size
     int maxlen = file_length - (piece*piece_length+offset);
@@ -297,9 +313,9 @@ void request_block(struct peer_state* peer, int piece, int offset) {
     // no point in sending anything if we got choked. We'll restart on unchoke.
     // WARNING: not handling the case where we get choked in the middle of a piece! Does this happen?
     if(!peer->choked) {
-	send(peer->socket,&request,sizeof(request),0);		
+	send(peer->socket,&request,sizeof(request),0);
     }
-    else 
+    else
 	fprintf(stderr,"Not sending, choked!\n");
 }
 
@@ -322,71 +338,141 @@ void send_interested(struct peer_state* peer) {
 }
 
 
+void connect_to_peer(struct peer_addr *peeraddr) {
+    if(peer_connected(peeraddr->addr)) {
+	fprintf(stderr,"Already connected\n");
+	return;
+    }
+
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = peeraddr->addr;
+    addr.sin_port = peeraddr->port;
+
+    /* after 60 seconds of nothing, we probably should poke the peer to see if we can wake them up */
+    struct timeval tv;
+    tv.tv_sec = 60;
+    tv.tv_usec = 0;
+    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv,  sizeof(tv))) {
+	perror("setsockopt");
+	print_peer_address(peeraddr);
+	return;
+    }
+
+    int res = connect(s, (struct sockaddr*)&addr, sizeof(addr));
+    if(res == -1) {
+	struct in_addr inaddr;
+	inaddr.s_addr = peeraddr->addr;
+	fprintf(stderr,"Couldn't connect to IP(%s) PORT(%hu) \n",
+		inet_ntoa(inaddr),
+		peeraddr->port);
+	fflush(stderr);
+	perror("Error while connecting.");
+	return;
+    }
+
+    /* register the new peer in our list of peers */
+    struct peer_state* peer = calloc(1,sizeof(struct peer_state));
+    peer->socket = s;
+    peer->ip=peeraddr->addr;
+    peer->next = peers;
+    peer->connected=0;
+    peer->choked=1;
+    peer->incoming=malloc(BUFSIZE);
+    peer->outgoing=malloc(BUFSIZE);
+    peer->outgoing_count = 0;
+    peer->bitfield = calloc(1,file_length/piece_length/8+1); //start with an empty bitfield
+    peers=peer;
+
+    // Queue a handshake message for each peer
+    char protocol[] = "BitTorrent protocol";
+    unsigned char pstrlen = strlen(protocol); // not sure if this should be with or without terminator
+    unsigned char buf[pstrlen+49];
+    buf[0]=pstrlen;
+    memcpy(buf+1,protocol,pstrlen);
+    memcpy(buf+1+pstrlen+8,digest,20);
+    memcpy(buf+1+pstrlen+8+20,peer_id,20);
+    send_message(peer, buf, sizeof(buf));
+
+    printf("sent handshake successfully to peer ");
+    print_peer_address(peeraddr);
+}
+
 /* establish a connection to the peer, assuming there isn't already a connection to it.
 
    In this version, each peer gets a separate thread so connect_to_peer can be written as a
-   single peer-specific loop. For the homework solution, the loop needs to apply to all peers, 
+   single peer-specific loop. For the homework solution, the loop needs to apply to all peers,
    not just the one.
 */
-void connect_to_peers(struct peer_addr *peeraddr_list) {
+/* void connect_to_peers(struct peer_addr *peeraddr_list, int count) { */
 
-    for (struct peer_addr *peeraddr = peeraddr_list; peeraddr; peeraddr++) {
-	fprintf(stderr,"Connecting...\n");
-	
-	if(peer_connected(peeraddr->addr)) {
-	    fprintf(stderr,"Already connected\n");
-	    continue;
-	}
-	
-	int s = socket(AF_INET, SOCK_STREAM, 0);
-	struct sockaddr_in addr;
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = peeraddr->addr;
-	addr.sin_port = peeraddr->port;
+/*     int i; */
+/*     for (i=0; i<count; i++) { */
+/* 	struct peer_addr *peeraddr = &peeraddr_list[i]; */
+/* 	fprintf(stderr,"Connecting...\n"); */
 
-	/* after 60 seconds of nothing, we probably should poke the peer to see if we can wake them up */
-	struct timeval tv;
-	tv.tv_sec = 60;
-	if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv,  sizeof tv)) {
-	    perror("setsockopt");
-	    continue;
-	}
+/* 	if(peer_connected(peeraddr->addr)) { */
+/* 	    fprintf(stderr,"Already connected\n"); */
+/* 	    continue; */
+/* 	} */
 
-	int res = connect(s, (struct sockaddr*)&addr, sizeof(addr));
-	if(res == -1) {
-	    fprintf(stderr,"Couldn't connect to %d \n", peeraddr->port);
-	    fflush(stderr);
-	    perror("Error while connecting.");
-	    continue;
-	}
+/* 	int s = socket(AF_INET, SOCK_STREAM, 0); */
+/* 	struct sockaddr_in addr; */
+/* 	addr.sin_family = AF_INET; */
+/* 	addr.sin_addr.s_addr = peeraddr->addr; */
+/* 	addr.sin_port = peeraddr->port; */
 
-	/* register the new peer in our list of peers */
-	struct peer_state* peer = calloc(1,sizeof(struct peer_state));
-	peer->socket = s;
-	peer->ip=peeraddr->addr;
-	peer->next = peers;
-	peer->connected=0;
-	peer->choked=1;
-	peer->incoming=malloc(BUFSIZE);
-	peer->outgoing=malloc(BUFSIZE);
-	peer->outgoing_count = 0;
-	peer->bitfield = calloc(1,file_length/piece_length/8+1); //start with an empty bitfield
-	peers=peer;
+/* 	/\* puts("HIHIHIHHI!!!"); *\/ */
+/* 	/\* struct in_addr ipaddr; *\/ */
+/* 	/\* ipaddr.s_addr = peeraddr->addr; *\/ */
+/* 	/\* printf("peer address: IP(%s) PORT(%d)\n", *\/ */
+/* 	/\*        inet_ntoa(ipaddr), *\/ */
+/* 	/\*        peeraddr->port); *\/ */
 
-	// Queue a handshake message for each peer
-	char protocol[] = "BitTorrent protocol";
-	unsigned char pstrlen = strlen(protocol); // not sure if this should be with or without terminator
-	unsigned char buf[pstrlen+49];
-	buf[0]=pstrlen;
-	memcpy(buf+1,protocol,pstrlen);
-	memcpy(buf+1+pstrlen+8,digest,20);
-	memcpy(buf+1+pstrlen+8+20,peer_id,20);
-	send_message(peer, buf, sizeof(buf));
+/* 	/\* after 60 seconds of nothing, we probably should poke the peer to see if we can wake them up *\/ */
+/* 	struct timeval tv; */
+/* 	tv.tv_sec = 60; */
+/* 	if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv,  sizeof tv)) { */
+/* 	    perror("setsockopt"); */
+/* 	    continue; */
+/* 	} */
 
-	peeraddr++;
-    }
+/* 	int res = connect(s, (struct sockaddr*)&addr, sizeof(addr)); */
+/* 	if(res == -1) { */
+/* 	    fprintf(stderr,"Couldn't connect to %d \n", peeraddr->port); */
+/* 	    fflush(stderr); */
+/* 	    perror("Error while connecting."); */
+/* 	    continue; */
+/* 	} */
 
-}
+/* 	/\* register the new peer in our list of peers *\/ */
+/* 	struct peer_state* peer = calloc(1,sizeof(struct peer_state)); */
+/* 	peer->socket = s; */
+/* 	peer->ip=peeraddr->addr; */
+/* 	peer->next = peers; */
+/* 	peer->connected=0; */
+/* 	peer->choked=1; */
+/* 	peer->incoming=malloc(BUFSIZE); */
+/* 	peer->outgoing=malloc(BUFSIZE); */
+/* 	peer->outgoing_count = 0; */
+/* 	peer->bitfield = calloc(1,file_length/piece_length/8+1); //start with an empty bitfield */
+/* 	peers=peer; */
+
+/* 	// Queue a handshake message for each peer */
+/* 	char protocol[] = "BitTorrent protocol"; */
+/* 	unsigned char pstrlen = strlen(protocol); // not sure if this should be with or without terminator */
+/* 	unsigned char buf[pstrlen+49]; */
+/* 	buf[0]=pstrlen; */
+/* 	memcpy(buf+1,protocol,pstrlen); */
+/* 	memcpy(buf+1+pstrlen+8,digest,20); */
+/* 	memcpy(buf+1+pstrlen+8+20,peer_id,20); */
+/* 	send_message(peer, buf, sizeof(buf)); */
+
+/* 	peeraddr++; */
+/*     } */
+
+/* } */
 
 void receive_handshake(struct peer_state *peer) {
     /* receive the handshake message. This is different from all other messages, making things ugly. */
@@ -418,127 +504,24 @@ void receive_handshake(struct peer_state *peer) {
 	memmove(peer->incoming,peer->incoming+peer->incoming[0]+49,peer->count);
 
     peer->connected = 1;
+
+    struct in_addr inaddr;
+    inaddr.s_addr = peer->ip;
+    printf("Successfully connected to peer %s!\n", inet_ntoa(inaddr));    
 }
 
-//TODO:move this in select loop
-/*     int newbytes=0; */
-/*     while(1) { */
-/* 	int msglen = receive_message(peer); */
-
-/* 	fflush(stdout); */
-/* 	if(msglen == 0) { */
-/* 	    peer->connected = 0; */
-/* 	    close(peer->socket); */
-/* 	    piece_status[peer->requested_piece]=PIECE_EMPTY; */
-/* 	    draw_state(); */
-/* 	    goto shutdown; */
-/* 	}; */
-
-/* 	switch(peer->incoming[4]) { */
-/* 	    // CHOKE */
-/* 	case 0: { */
-/* 	    if(debug) */
-/* 		fprintf(stderr,"Choke\n"); */
-/* 	    peer->choked = 1; */
-/* 	    piece_status[peer->requested_piece]=PIECE_EMPTY; */
-/* 	    peer->requested_piece = -1; */
-/* 	    break; */
-/* 	} */
-/* 	    // UNCHOKE */
-/* 	case 1: { */
-/* 	    if(debug) */
-/* 		fprintf(stderr,"Unchoke\n"); */
-/* 	    peer->choked = 0; */
-
-/* 	    // grab a new piece - WARNING: this assumes that you don't get choked mid-piece! */
-/* 	    peer->requested_piece = next_piece(-1); */
-/* 	    request_block(peer,peer->requested_piece,0); */
-/* 	    break; */
-/* 	} */
-/* 	    // HAVE -- update the bitfield for this peer */
-/* 	case 4: { */
-/* 	    int piece_index = ntohl(*((int*)&peer->incoming[5])); */
-/* 	    int bitfield_byte = piece_index/8; */
-/* 	    int bitfield_bit = 7-(piece_index%8); */
-/* 	    if(debug) */
-/* 		fprintf(stderr,"Have %d\n",piece_index); */
-/* 	    // OR the appropriate mask byte with a byte with the appropriate single bit set */
-/* 	    peer->bitfield[bitfield_byte]|=1<<bitfield_bit; */
-			 
-/* 	    send_interested(peer); */
-/* 	    break; */
-/* 	} */
-/* 	    // BITFIELD -- set the bitfield for this peer */
-/* 	case 5: */
-/* 	    peer->choked = 0; // let's assume a bitfield means we're allowed to go... */
-/* 	    if(debug) */
-/* 		printf("Bitfield of length %d\n",msglen-1); */
-/* 	    int fieldlen = msglen - 1; */
-/* 	    if(fieldlen != (file_length/piece_length/8+1)) { */
-/* 		fprintf(stderr,"Incorrect bitfield size, expected %d\n",file_length/piece_length/8+1); */
-/* 		goto shutdown; */
-/* 	    } */
-/* 	    memcpy(peer->bitfield,peer->incoming+5,fieldlen); */
-
-/* 	    send_interested(peer); */
-/* 	    break; */
-/* 	    // PIECE */
-/* 	case 7: { */
-/* 	    int piece = ntohl(*((int*)&peer->incoming[5])); */
-/* 	    int offset = ntohl(*((int*)&peer->incoming[9])); */
-/* 	    int datalen = msglen - 9; */
-
-/* 	    fprintf(stderr,"Writing piece %d, offset %d, ending at %d\n",piece,offset,piece*piece_length+offset+datalen); */
-/* 	    write_block(peer->incoming+13,piece,offset,datalen,1); */
-
-/* 	    draw_state(); */
-/* 	    offset+=datalen; */
-/* 	    if(offset==piece_length || (piece*piece_length+offset == file_length) ) { */
-
-/* 		if(debug) */
-/* 		    fprintf(stderr,"Reached end of piece %d at offset %d\n",piece,offset); */
-
-/* 		peer->requested_piece=next_piece(piece); */
-/* 		offset = 0; */
-				
-/* 		if(peer->requested_piece==-1) { */
-/* 		    fprintf(stderr,"No more pieces to download!\n"); */
-
-/* 		    // don't exit if some piece is still being downloaded */
-/* 		    for(int i=0;i<file_length/piece_length+1;i++) */
-/* 			if(piece_status[i]!=2) */
-/* 			    goto shutdown; */
-/* 		    goto shutdown; */
-/* 		} */
-/* 	    } */
-			
-/* 	    request_block(peer,peer->requested_piece,offset); */
-/* 	    break; */
-/* 	} */
-
-/* 	case 20: */
-/* 	    printf("Extended type is %d\n",peer->incoming[5]); */
-/* 	    struct bencode *extended = ben_decode(peer->incoming,msglen); */
-/* 	    print_bencode(extended); */
-/* 	    break; */
-/* 	} */
-/* 	drop_message(peer); */
-/*     } */
-
-/* shutdown: */
-/*     fprintf(stderr,"Shutting down one peer.\n"); */
-/*     peer->connected = 0; */
-/*     pthread_cond_signal(&finish_cond); */
-/*     close(peer->socket); */
-/*     return; */
-
-struct peer_addr *start_peers() {
+/**
+ * contacts the tracker for a list of peers
+ * addrs = will be filled with peer addresses
+ * returns: number of peers
+ * */
+void start_peers(struct peer_addr **addrs) {
     // Contact the tracker and handle the announcement we receive
     CURL *curl;
     CURLcode res;
 
     curl = curl_easy_init();
-    struct peer_addr *peer_addr_list = NULL;
+    int num_peers;
     if(curl) {
 	curl_easy_setopt(curl, CURLOPT_URL, announce_url);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 1);
@@ -548,8 +531,8 @@ struct peer_addr *start_peers() {
 	char *tmp_name = "/tmp/anno-llovett";
 	FILE *anno = fopen(tmp_name,"w+");
 	int attempts=0;
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, anno); 
-	while((res = curl_easy_perform(curl)) !=CURLE_OK && 
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, anno);
+	while((res = curl_easy_perform(curl)) !=CURLE_OK &&
 	      attempts < 5) {
 	    fprintf(stderr, "curl_easy_perform() failed: %s\n",
 		    curl_easy_strerror(res));
@@ -565,32 +548,33 @@ struct peer_addr *start_peers() {
 	    }
 	    // the announcement document is in <tmp_name>
 	    // so map that into memory, then call handle_announcement on the returned pointer
-	    peer_addr_list = handle_announcement(mmap(0,anno_stat.st_size,PROT_READ,MAP_SHARED,open(tmp_name,O_RDONLY),0),
-						 anno_stat.st_size);
+	    handle_announcement(mmap(0,anno_stat.st_size,PROT_READ,MAP_SHARED,open(tmp_name,O_RDONLY),0),
+				anno_stat.st_size);
 	}
 	curl_easy_cleanup(curl);
     }
-
-    return peer_addr_list;
 }
 
 /* handle_announcement reads an announcement document to find some peers to download from.
    start a new tread for each peer.
+
+   addr_list = will be filled with lists of peer addresses
+   returns: number of peers
 */
-struct peer_addr *handle_announcement(char *ptr, size_t size) {
+void handle_announcement(char *ptr, size_t size) {
     struct bencode* anno = ben_decode(ptr,size);
 
     printf("Torrent has %lld seeds and %lld downloading peers. \n",
 	   ((struct bencode_int*)ben_dict_get_by_str(anno,"complete"))->ll,
 	   ((struct bencode_int*)ben_dict_get_by_str(anno,"incomplete"))->ll);
-		 
+
     struct bencode_list *peer_addrs = (struct bencode_list*)ben_dict_get_by_str(anno,"peers");
 
-    /* unfortunately, the list of peers could be either in bencoded format, or in binary format. 
-       the binary format value is passed as a string, bencoded format is passed as a list. 
+    /* unfortunately, the list of peers could be either in bencoded format, or in binary format.
+       the binary format value is passed as a string, bencoded format is passed as a list.
        We handle the two cases separately below.
 
-       For each peer, we start a new thread to connect to the peer. Your solution is not allowed 
+       For each peer, we start a new thread to connect to the peer. Your solution is not allowed
        to use threads.
     */
     // handle the binary case
@@ -600,52 +584,149 @@ struct peer_addr *handle_announcement(char *ptr, size_t size) {
 	// the "string" in peers is really a list of peer_addr structs, so we'll just cast it as such
 	struct peer_addr *peerlist = (struct peer_addr*)((struct bencode_str*)peer_addrs)->s;
 
-	for(int i=0;i<((struct bencode_str*)peer_addrs)->len/6;i++) {
+	int i;
+	for(i=0;i<((struct bencode_str*)peer_addrs)->len/6;i++) {
 	    struct in_addr a;
 	    a.s_addr = peerlist[i].addr;
 	    printf("Found peer %s:%d\n",inet_ntoa(a),ntohs(peerlist[i].port));
+	    fflush(stdout);
+
+	    connect_to_peer(&peerlist[i]);
+
 	    /* pthread_t thread; */
 	    /* pthread_create(&thread,0,connect_to_peer,&peerlist[i]); */
 	}
 
-	return peerlist;
     }
     // handle the bencoded case
     else {
-	struct peer_addr *peerlist = (struct peer_addr*)malloc(sizeof(struct peer_addr)*(peer_addrs->n));
-	for(int i=0;i<peer_addrs->n;i++) {
+	int i;
+	for(i=0;i<peer_addrs->n;i++) {
 	    printf("Got bencoded list of peers\n");
 	    struct bencode *peer = peer_addrs->values[i];
 	    char *address = ((struct bencode_str*)ben_dict_get_by_str(peer,"ip"))->s;
 	    unsigned short port = ((struct bencode_int*)ben_dict_get_by_str(peer,"port"))->ll;
 	    printf("Found peer %s:%d\n",address,port);
+	    fflush(stdout);
 
 	    // pthread_create allows us to pass in one pointer. For the bencoded case, we allocate a new
 	    // peer_addr struct, and pass that in. Note that we can't allocate this on the stack, as it would
-	    // be immediately overwritten before the thread even got started. 
+	    // be immediately overwritten before the thread even got started.
 
-	    peerlist[i].addr=inet_addr(address);
-	    peerlist[i].port=htons(port);
+	    struct peer_addr addr;
+	    addr.addr = inet_addr(address);
+	    addr.port = htons(port);
+	    connect_to_peer(&addr);
 
 	    /* pthread_t thread; */
 	    /* pthread_create(&thread,0,connect_to_peer,&peeraddr); */
 	}
-	return peerlist;
     }
-	
-    /* // wait for a signal that all the downloading is done */
-    /* while(missing_blocks()>0) { */
-    /* 	pthread_mutex_lock(&status_lock); */
-    /* 	pthread_cond_wait(&finish_cond,&status_lock); */
-    /* 	fprintf(stderr,"One thread finished, %d active peers, %d missing blocks\n",active_peers(),missing_blocks()); */
+}
 
-    /* 	if(active_peers()==0 && missing_blocks()>0) { */
-    /* 	    printf("Ran out of active peers, reconnecting.\n"); */
-    /* 	    start_peers(); */
-    /* 	} */
+void handle_message(struct peer_state *peer) {
+    int newbytes=0;
+    int msglen = ntohl(((int*)peer->incoming)[0]);
+    
+    fflush(stdout);
+    if(msglen == 0) {
+	peer->connected = 0;
+	close(peer->socket);
+	piece_status[peer->requested_piece]=PIECE_EMPTY;
+	draw_state();
+	shutdown_peer(peer);
+    };
 
-    /* 	pthread_mutex_unlock(&status_lock); */
-    /* } */
+    switch(peer->incoming[4]) {
+	// CHOKE
+    case 0: {
+	if(debug)
+	    fprintf(stderr,"Choke\n");
+	peer->choked = 1;
+	piece_status[peer->requested_piece]=PIECE_EMPTY;
+	peer->requested_piece = -1;
+	break;
+    }
+	// UNCHOKE
+    case 1: {
+	if(debug)
+	    fprintf(stderr,"Unchoke\n");
+	peer->choked = 0;
+
+	// grab a new piece - WARNING: this assumes that you don't get choked mid-piece!
+	peer->requested_piece = next_piece(-1);
+	request_block(peer,peer->requested_piece,0);
+	break;
+    }
+	// HAVE -- update the bitfield for this peer
+    case 4: {
+	int piece_index = ntohl(*((int*)&peer->incoming[5]));
+	int bitfield_byte = piece_index/8;
+	int bitfield_bit = 7-(piece_index%8);
+	if(debug)
+	    fprintf(stderr,"Have %d\n",piece_index);
+	// OR the appropriate mask byte with a byte with the appropriate single bit set
+	peer->bitfield[bitfield_byte]|=1<<bitfield_bit;
+
+	send_interested(peer);
+	break;
+    }
+	// BITFIELD -- set the bitfield for this peer
+    case 5:
+	peer->choked = 0; // let's assume a bitfield means we're allowed to go...
+	if(debug)
+	    printf("Bitfield of length %d\n",msglen-1);
+	int fieldlen = msglen - 1;
+	if(fieldlen != (file_length/piece_length/8+1)) {
+	    fprintf(stderr,"Incorrect bitfield size, expected %d\n",file_length/piece_length/8+1);
+	    shutdown_peer(peer);
+	}
+	memcpy(peer->bitfield,peer->incoming+5,fieldlen);
+
+	send_interested(peer);
+	break;
+	// PIECE
+    case 7: {
+	int piece = ntohl(*((int*)&peer->incoming[5]));
+	int offset = ntohl(*((int*)&peer->incoming[9]));
+	int datalen = msglen - 9;
+
+	fprintf(stderr,"Writing piece %d, offset %d, ending at %d\n",piece,offset,piece*piece_length+offset+datalen);
+	write_block(peer->incoming+13,piece,offset,datalen,1);
+
+	draw_state();
+	offset+=datalen;
+	if(offset==piece_length || (piece*piece_length+offset == file_length) ) {
+
+	    if(debug)
+		fprintf(stderr,"Reached end of piece %d at offset %d\n",piece,offset);
+
+	    peer->requested_piece=next_piece(piece);
+	    offset = 0;
+
+	    if(peer->requested_piece==-1) {
+		fprintf(stderr,"No more pieces to download!\n");
+
+		// don't exit if some piece is still being downloaded
+		for(int i=0;i<file_length/piece_length+1;i++)
+		    if(piece_status[i]!=2)
+			shutdown_peer(peer);
+		shutdown_peer(peer);
+	    }
+	}
+
+	request_block(peer,peer->requested_piece,offset);
+	break;
+    }
+
+    case 20:
+	printf("Extended type is %d\n",peer->incoming[5]);
+	struct bencode *extended = ben_decode(peer->incoming,msglen);
+	print_bencode(extended);
+	break;
+    }
+
+    drop_message(peer);
 }
 
 int main(int argc, char** argv) {
@@ -655,11 +736,11 @@ int main(int argc, char** argv) {
     }
 
     setvbuf(stdout,screenbuf,_IOFBF,10000);
-		
+
     // create a global peer_id for this session. Every peer_id should include -OBCS342-.
     for(int i=strlen(peer_id);i<20;i++)
 	peer_id[i]='0'+random()%('Z'-'0'); // random numbers/letters between 0 and Z
-	
+
     // make sure the torrent file exists
     struct stat file_stat;
     if(stat(argv[1],&file_stat)) {
@@ -673,7 +754,7 @@ int main(int argc, char** argv) {
     if(buf==(void*)-1) {
 	perror("couldn't mmap file");
 	exit(1);
-    }		 
+    }
     size_t off = 0;
     int error = 0;
     torrent = (struct bencode_dict*)ben_decode2(buf,file_stat.st_size,&off,&error);
@@ -684,7 +765,7 @@ int main(int argc, char** argv) {
 
     // pull out the .info part, which has stuff about the file we're downloading
     info = (struct bencode*)ben_dict_get_by_str((struct bencode*)torrent,"info");
-	
+
     struct bencode_list* files = (struct bencode_list*)ben_dict_get_by_str(info,"files");
     // multi-file case
     if(files) {
@@ -693,15 +774,15 @@ int main(int argc, char** argv) {
 	    struct bencode_list* path = (struct bencode_list*)ben_dict_get_by_str(file,"path");
 	    printf("Filename %s/%s\n",((struct bencode_str*)ben_dict_get_by_str(info,"name"))->s,((struct bencode_str*)path->values[0])->s);
 
-	    // accumulate a total length so we know how many pieces there are 
-	    file_length+=((struct bencode_int*)ben_dict_get_by_str(file,"length"))->ll; 
+	    // accumulate a total length so we know how many pieces there are
+	    file_length+=((struct bencode_int*)ben_dict_get_by_str(file,"length"))->ll;
 	}
     }
     // single-file case
     else {
 	struct bencode_str* name = (struct bencode_str*)ben_dict_get_by_str(info,"name");
 	if(name) {
-	    file_length = ((struct bencode_int*)ben_dict_get_by_str(info,"length"))->ll;			
+	    file_length = ((struct bencode_int*)ben_dict_get_by_str(info,"length"))->ll;
 	}
     }
     fflush(stdout);
@@ -717,15 +798,15 @@ int main(int argc, char** argv) {
 
     /* compute the message digest and info_hash from the "info" field in the torrent */
     size_t len;
-    char info_hash[100];  
+    char info_hash[100];
     char* encoded = ben_encode(&len,(struct bencode*)info);
     SHA1(encoded,len,digest); // digest is a global that holds the raw 20 bytes
-	
+
     // info_hash is a stringified version of the digest, for use in the announce URL
     memset(info_hash,0,100);
     for(int i=0;i<20;i++)
 	sprintf(info_hash+3*i,"%%%02x",digest[i]);
-		 
+
 
     // compile a suitable announce URL for our document
     sprintf(announce_url,"%s?info_hash=%s&peer_id=%s&port=6881&left=%d",((struct bencode_str*)ben_dict_get_by_str((struct bencode*)torrent,"announce"))->s,info_hash,peer_id,file_length);
@@ -733,8 +814,9 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     // Contact the tracker and get the list of peer addresses from that
-    struct peer_addr *peer_addr_list = start_peers();
-    connect_to_peers(peer_addr_list);
+    struct peer_addr **peer_addr_list = (struct peer_addr**)malloc(sizeof(struct peer_addr*));
+    puts("calling start_peers...");
+    start_peers(peer_addr_list);
 
     /***************/
     /* SELECT LOOP */
@@ -743,9 +825,11 @@ int main(int argc, char** argv) {
     // Select loop goes here
     while (1) {
 	fd_set rtemp, wtemp;
-	/* FD_COPY(&readset, &rtemp); */
-	/* FD_COPY(&writeset, &wtemp); */
+	memcpy(&rtemp, &readset, sizeof(fd_set));
+	memcpy(&wtemp, &writeset, sizeof(fd_set));
 
+	puts("selecting!");
+	fflush(stdout);
 	int selected = select(FD_SETSIZE, &rtemp, &wtemp, NULL, 0);
 
 	struct peer_state *peer = peers;
@@ -755,11 +839,29 @@ int main(int argc, char** argv) {
 		    receive_handshake(peer);
 		} else {
 		    // handle the non-handshake message
-		    receive_message(peer);
+		    int msglen = 0;
+		    if ((msglen = receive_message(peer))) {
+			handle_message(peer);
+		    }
 		}
 	    } else if (FD_ISSET(peer->socket, &wtemp)) {
-		// write message
+		int msgsize = peer->outgoing_count;
+		puts("sending.....");
+		fflush(stdout);
+		int sent_bytes = send(peer->socket, peer->outgoing, msgsize, 0);
+		puts("sent.");
+		fflush(stdout);
+		if (sent_bytes == -1) {
+		    perror("send");
+		    exit(1);
+		}
+		memmove(peer->outgoing, peer->outgoing+sent_bytes, peer->outgoing_count-sent_bytes);
+		peer->outgoing_count -= sent_bytes;
+		if (peer->outgoing_count == 0) {
+		    FD_CLR(peer->socket, &writeset);
+		}
 	    }
+	    peer = peer->next;
 	}
 
 	// wait for a signal that all the downloading is done
@@ -770,8 +872,7 @@ int main(int argc, char** argv) {
 
 	    if(active_peers()==0 && missing_blocks()>0) {
 		printf("Ran out of active peers, reconnecting.\n");
-		peer_addr_list = start_peers();
-		connect_to_peers(peer_addr_list);
+		start_peers(peer_addr_list);
 	    }
 
 	    pthread_mutex_unlock(&status_lock);
