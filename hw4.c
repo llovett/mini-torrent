@@ -234,9 +234,14 @@ cleanup:
 	pthread_mutex_unlock(&file_lock); 
 }
 
-// Wait for peer to send us another full message, then return the length of the new message.
+void shutdown_peer(struct peer_state *peer) {
+    close(peer->socket);
+    peer->connected = 0;
+}
+
+// Wait for peer to send us a message (could be a partial message!)
 int receive_message(struct peer_state* peer) {
-    while(peer->count<4 || ntohl(((int*)peer->incoming)[0])+4 > peer->count) {
+    if (peer->count<4 || ntohl(((int*)peer->incoming)[0])+4 > peer->count) {
 	int newbytes=recv(peer->socket,peer->incoming+peer->count,BUFSIZE-peer->count,0);
 	if(newbytes == 0) {			
 	    fprintf(stderr,"Connection was closed by peer, count was %d, msg size %d\n",peer->count,ntohl(((int*)peer->incoming)[0]));
@@ -298,6 +303,12 @@ void request_block(struct peer_state* peer, int piece, int offset) {
 	fprintf(stderr,"Not sending, choked!\n");
 }
 
+/* procedure for queueing a message <msg> of length <len> to be sent to <peer> */
+int send_message(struct peer_state *peer, char *msg, int len) {
+    memcpy(peer->outgoing+peer->outgoing_count, msg, len);
+    peer->outgoing_count += len;
+    FD_SET(peer->socket, &writeset);
+}
 
 void send_interested(struct peer_state* peer) {
     struct {
@@ -317,72 +328,85 @@ void send_interested(struct peer_state* peer) {
    single peer-specific loop. For the homework solution, the loop needs to apply to all peers, 
    not just the one.
 */
-void *connect_to_peer(void* pa) {
-    fprintf(stderr,"Connecting...\n");
-    struct peer_addr* peeraddr = (struct peer_addr*)pa;
+void connect_to_peers(struct peer_addr *peeraddr_list) {
 
-    if(peer_connected(peeraddr->addr)) {
-	fprintf(stderr,"Already connected\n");
-	return 0;
+    for (struct peer_addr *peeraddr = peeraddr_list; peeraddr; peeraddr++) {
+	fprintf(stderr,"Connecting...\n");
+	
+	if(peer_connected(peeraddr->addr)) {
+	    fprintf(stderr,"Already connected\n");
+	    continue;
+	}
+	
+	int s = socket(AF_INET, SOCK_STREAM, 0);
+	struct sockaddr_in addr;
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = peeraddr->addr;
+	addr.sin_port = peeraddr->port;
+
+	/* after 60 seconds of nothing, we probably should poke the peer to see if we can wake them up */
+	struct timeval tv;
+	tv.tv_sec = 60;
+	if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv,  sizeof tv)) {
+	    perror("setsockopt");
+	    continue;
+	}
+
+	int res = connect(s, (struct sockaddr*)&addr, sizeof(addr));
+	if(res == -1) {
+	    fprintf(stderr,"Couldn't connect to %d \n", peeraddr->port);
+	    fflush(stderr);
+	    perror("Error while connecting.");
+	    continue;
+	}
+
+	/* register the new peer in our list of peers */
+	struct peer_state* peer = calloc(1,sizeof(struct peer_state));
+	peer->socket = s;
+	peer->ip=peeraddr->addr;
+	peer->next = peers;
+	peer->connected=0;
+	peer->choked=1;
+	peer->incoming=malloc(BUFSIZE);
+	peer->outgoing=malloc(BUFSIZE);
+	peer->outgoing_count = 0;
+	peer->bitfield = calloc(1,file_length/piece_length/8+1); //start with an empty bitfield
+	peers=peer;
+
+	// Queue a handshake message for each peer
+	char protocol[] = "BitTorrent protocol";
+	unsigned char pstrlen = strlen(protocol); // not sure if this should be with or without terminator
+	unsigned char buf[pstrlen+49];
+	buf[0]=pstrlen;
+	memcpy(buf+1,protocol,pstrlen);
+	memcpy(buf+1+pstrlen+8,digest,20);
+	memcpy(buf+1+pstrlen+8+20,peer_id,20);
+	send_message(peer, buf, sizeof(buf));
+
+	peeraddr++;
     }
 
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = peeraddr->addr;
-    addr.sin_port = peeraddr->port;
+}
 
-    /* after 60 seconds of nothing, we probably should poke the peer to see if we can wake them up */
-    struct timeval tv;
-    tv.tv_sec = 60;
-    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv,  sizeof tv)) {
-	perror("setsockopt");
-	return 0;
-    }	
-
-    int res = connect(s, (struct sockaddr*)&addr, sizeof(addr));
-    if(res == -1) {
-	fprintf(stderr,"Couldn't connect to %d \n", peeraddr->port);
-	fflush(stderr);
-	perror("Error while connecting.");
-	return 0;
-    }
-
-    /* send the handshake message */
-    char protocol[] = "BitTorrent protocol";
-    unsigned char pstrlen = strlen(protocol); // not sure if this should be with or without terminator
-    unsigned char buf[pstrlen+49];
-    buf[0]=pstrlen;
-    memcpy(buf+1,protocol,pstrlen); 
-    memcpy(buf+1+pstrlen+8,digest,20);
-    memcpy(buf+1+pstrlen+8+20,peer_id,20);				 
-
-    send(s,buf,sizeof(buf),0);
-
-    /* register the new peer in our list of peers */
-    struct peer_state* peer = calloc(1,sizeof(struct peer_state));
-    peer->socket = s;
-    peer->ip=peeraddr->addr;
-    peer->next = peers;
-    peer->connected=1;
-    peer->choked=1;
-    peer->incoming=malloc(BUFSIZE);
-    peer->bitfield = calloc(1,file_length/piece_length/8+1); //start with an empty bitfield
-    peers=peer;
-
+void receive_handshake(struct peer_state *peer) {
     /* receive the handshake message. This is different from all other messages, making things ugly. */
-    while(peer->count < 4 || peer->count < peer->incoming[0]+49) {
+    if (peer->count < 4 || peer->count < peer->incoming[0]+49) {
 	int newbytes = recv(peer->socket,peer->incoming+peer->count,BUFSIZE-peer->count,0);
 	if(newbytes==0) {
 	    perror("receiving handshake");
-	    goto shutdown;
+	    shutdown_peer(peer);
 	}
 	peer->count+=newbytes;
+    }
+    // Testing again, since we got rid of the loop. We'll have more chances to receive
+    // the whole handshake
+    if (peer->count < 4 || peer->count < peer->incoming[0]+49) {
+	return;
     }
 
     if(memcmp(peer->incoming+peer->incoming[0]+1+8+20,"-OBCS342-",strlen("-OBCS342-"))==0) {
 	fprintf(stderr,"Caught a CS342 peer, exiting.\n");
-	goto shutdown;
+	shutdown_peer(peer);
     }
 
     // forget handshake packet
@@ -390,120 +414,123 @@ void *connect_to_peer(void* pa) {
 	printf("handshake message is %d bytes\n",peer->count);
 
     peer->count -= peer->incoming[0]+49;
-    if(peer->count) 
+    if(peer->count)
 	memmove(peer->incoming,peer->incoming+peer->incoming[0]+49,peer->count);
 
-    int newbytes=0;
-    while(1) {
-	int msglen = receive_message(peer);
-
-	fflush(stdout);
-	if(msglen == 0) {
-	    peer->connected = 0;
-	    close(peer->socket);
-	    piece_status[peer->requested_piece]=PIECE_EMPTY;
-	    draw_state();
-	    goto shutdown;
-	};
-
-	switch(peer->incoming[4]) {
-	    // CHOKE
-	case 0: {
-	    if(debug)
-		fprintf(stderr,"Choke\n");
-	    peer->choked = 1;
-	    piece_status[peer->requested_piece]=PIECE_EMPTY;
-	    peer->requested_piece = -1;
-	    break;
-	}
-	    // UNCHOKE
-	case 1: {
-	    if(debug)
-		fprintf(stderr,"Unchoke\n");
-	    peer->choked = 0;
-
-	    // grab a new piece - WARNING: this assumes that you don't get choked mid-piece!
-	    peer->requested_piece = next_piece(-1);	
-	    request_block(peer,peer->requested_piece,0);
-	    break;
-	}
-	    // HAVE -- update the bitfield for this peer
-	case 4: {
-	    int piece_index = ntohl(*((int*)&peer->incoming[5]));
-	    int bitfield_byte = piece_index/8;
-	    int bitfield_bit = 7-(piece_index%8);
-	    if(debug)
-		fprintf(stderr,"Have %d\n",piece_index);
-	    // OR the appropriate mask byte with a byte with the appropriate single bit set
-	    peer->bitfield[bitfield_byte]|=1<<bitfield_bit;
-			 
-	    send_interested(peer);
-	    break;
-	}
-	    // BITFIELD -- set the bitfield for this peer
-	case 5:
-	    peer->choked = 0; // let's assume a bitfield means we're allowed to go...
-	    if(debug) 
-		printf("Bitfield of length %d\n",msglen-1);
-	    int fieldlen = msglen - 1;
-	    if(fieldlen != (file_length/piece_length/8+1)) {
-		fprintf(stderr,"Incorrect bitfield size, expected %d\n",file_length/piece_length/8+1);
-		goto shutdown;
-	    }				
-	    memcpy(peer->bitfield,peer->incoming+5,fieldlen);
-
-	    send_interested(peer);
-	    break;
-	    // PIECE
-	case 7: {
-	    int piece = ntohl(*((int*)&peer->incoming[5]));
-	    int offset = ntohl(*((int*)&peer->incoming[9]));
-	    int datalen = msglen - 9;
-
-	    fprintf(stderr,"Writing piece %d, offset %d, ending at %d\n",piece,offset,piece*piece_length+offset+datalen);
-	    write_block(peer->incoming+13,piece,offset,datalen,1);
-
-	    draw_state();
-	    offset+=datalen;
-	    if(offset==piece_length || (piece*piece_length+offset == file_length) ) {
-
-		if(debug) 
-		    fprintf(stderr,"Reached end of piece %d at offset %d\n",piece,offset);
-
-		peer->requested_piece=next_piece(piece);
-		offset = 0;
-				
-		if(peer->requested_piece==-1) {
-		    fprintf(stderr,"No more pieces to download!\n");
-
-		    // don't exit if some piece is still being downloaded
-		    for(int i=0;i<file_length/piece_length+1;i++) 
-			if(piece_status[i]!=2) 
-			    goto shutdown;					
-		    goto shutdown;			
-		}			 
-	    }
-			
-	    request_block(peer,peer->requested_piece,offset);
-	    break;									
-	}
-
-	case 20:
-	    printf("Extended type is %d\n",peer->incoming[5]);
-	    struct bencode *extended = ben_decode(peer->incoming,msglen);
-	    print_bencode(extended);
-	    break;
-	}
-	drop_message(peer);			 
-    }
-
-shutdown:
-    fprintf(stderr,"Shutting down one peer.\n");
-    peer->connected = 0;
-    pthread_cond_signal(&finish_cond);
-    close(peer->socket);
-    return 0;
+    peer->connected = 1;
 }
+
+//TODO:move this in select loop
+/*     int newbytes=0; */
+/*     while(1) { */
+/* 	int msglen = receive_message(peer); */
+
+/* 	fflush(stdout); */
+/* 	if(msglen == 0) { */
+/* 	    peer->connected = 0; */
+/* 	    close(peer->socket); */
+/* 	    piece_status[peer->requested_piece]=PIECE_EMPTY; */
+/* 	    draw_state(); */
+/* 	    goto shutdown; */
+/* 	}; */
+
+/* 	switch(peer->incoming[4]) { */
+/* 	    // CHOKE */
+/* 	case 0: { */
+/* 	    if(debug) */
+/* 		fprintf(stderr,"Choke\n"); */
+/* 	    peer->choked = 1; */
+/* 	    piece_status[peer->requested_piece]=PIECE_EMPTY; */
+/* 	    peer->requested_piece = -1; */
+/* 	    break; */
+/* 	} */
+/* 	    // UNCHOKE */
+/* 	case 1: { */
+/* 	    if(debug) */
+/* 		fprintf(stderr,"Unchoke\n"); */
+/* 	    peer->choked = 0; */
+
+/* 	    // grab a new piece - WARNING: this assumes that you don't get choked mid-piece! */
+/* 	    peer->requested_piece = next_piece(-1); */
+/* 	    request_block(peer,peer->requested_piece,0); */
+/* 	    break; */
+/* 	} */
+/* 	    // HAVE -- update the bitfield for this peer */
+/* 	case 4: { */
+/* 	    int piece_index = ntohl(*((int*)&peer->incoming[5])); */
+/* 	    int bitfield_byte = piece_index/8; */
+/* 	    int bitfield_bit = 7-(piece_index%8); */
+/* 	    if(debug) */
+/* 		fprintf(stderr,"Have %d\n",piece_index); */
+/* 	    // OR the appropriate mask byte with a byte with the appropriate single bit set */
+/* 	    peer->bitfield[bitfield_byte]|=1<<bitfield_bit; */
+			 
+/* 	    send_interested(peer); */
+/* 	    break; */
+/* 	} */
+/* 	    // BITFIELD -- set the bitfield for this peer */
+/* 	case 5: */
+/* 	    peer->choked = 0; // let's assume a bitfield means we're allowed to go... */
+/* 	    if(debug) */
+/* 		printf("Bitfield of length %d\n",msglen-1); */
+/* 	    int fieldlen = msglen - 1; */
+/* 	    if(fieldlen != (file_length/piece_length/8+1)) { */
+/* 		fprintf(stderr,"Incorrect bitfield size, expected %d\n",file_length/piece_length/8+1); */
+/* 		goto shutdown; */
+/* 	    } */
+/* 	    memcpy(peer->bitfield,peer->incoming+5,fieldlen); */
+
+/* 	    send_interested(peer); */
+/* 	    break; */
+/* 	    // PIECE */
+/* 	case 7: { */
+/* 	    int piece = ntohl(*((int*)&peer->incoming[5])); */
+/* 	    int offset = ntohl(*((int*)&peer->incoming[9])); */
+/* 	    int datalen = msglen - 9; */
+
+/* 	    fprintf(stderr,"Writing piece %d, offset %d, ending at %d\n",piece,offset,piece*piece_length+offset+datalen); */
+/* 	    write_block(peer->incoming+13,piece,offset,datalen,1); */
+
+/* 	    draw_state(); */
+/* 	    offset+=datalen; */
+/* 	    if(offset==piece_length || (piece*piece_length+offset == file_length) ) { */
+
+/* 		if(debug) */
+/* 		    fprintf(stderr,"Reached end of piece %d at offset %d\n",piece,offset); */
+
+/* 		peer->requested_piece=next_piece(piece); */
+/* 		offset = 0; */
+				
+/* 		if(peer->requested_piece==-1) { */
+/* 		    fprintf(stderr,"No more pieces to download!\n"); */
+
+/* 		    // don't exit if some piece is still being downloaded */
+/* 		    for(int i=0;i<file_length/piece_length+1;i++) */
+/* 			if(piece_status[i]!=2) */
+/* 			    goto shutdown; */
+/* 		    goto shutdown; */
+/* 		} */
+/* 	    } */
+			
+/* 	    request_block(peer,peer->requested_piece,offset); */
+/* 	    break; */
+/* 	} */
+
+/* 	case 20: */
+/* 	    printf("Extended type is %d\n",peer->incoming[5]); */
+/* 	    struct bencode *extended = ben_decode(peer->incoming,msglen); */
+/* 	    print_bencode(extended); */
+/* 	    break; */
+/* 	} */
+/* 	drop_message(peer); */
+/*     } */
+
+/* shutdown: */
+/*     fprintf(stderr,"Shutting down one peer.\n"); */
+/*     peer->connected = 0; */
+/*     pthread_cond_signal(&finish_cond); */
+/*     close(peer->socket); */
+/*     return; */
 
 struct peer_addr *start_peers() {
     // Contact the tracker and handle the announcement we receive
@@ -707,6 +734,7 @@ int main(int argc, char** argv) {
 
     // Contact the tracker and get the list of peer addresses from that
     struct peer_addr *peer_addr_list = start_peers();
+    connect_to_peers(peer_addr_list);
 
     /***************/
     /* SELECT LOOP */
@@ -724,8 +752,7 @@ int main(int argc, char** argv) {
 	while (peer) {
 	    if (FD_ISSET(peer->socket, &rtemp)) {
 		if (!peer->connected) {
-		    //TODO:implement receive_handshake(peer struct*)
-		    /* receive_handshake(peer); */
+		    receive_handshake(peer);
 		} else {
 		    // handle the non-handshake message
 		    receive_message(peer);
@@ -744,8 +771,7 @@ int main(int argc, char** argv) {
 	    if(active_peers()==0 && missing_blocks()>0) {
 		printf("Ran out of active peers, reconnecting.\n");
 		peer_addr_list = start_peers();
-
-		//TODO: construct peer states and such
+		connect_to_peers(peer_addr_list);
 	    }
 
 	    pthread_mutex_unlock(&status_lock);

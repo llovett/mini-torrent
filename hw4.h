@@ -11,6 +11,8 @@ struct peer_state {
     int connected;
     char* bitfield;
     char* incoming; // buffer where we store partial messages
+    char *outgoing; // buffer for messages going out to this peer
+    int outgoing_count; // number of bytes to be sent to this peer
     int requested_piece;
 
     int count; // number of bytes currently in the incoming buffer
