@@ -797,7 +797,6 @@ int main(int argc, char** argv) {
 
     // Contact the tracker and get the list of peer addresses from that
     struct peer_addr **peer_addr_list = (struct peer_addr**)malloc(sizeof(struct peer_addr*));
-    puts("calling start_peers...");
     start_peers(peer_addr_list);
 
     // Add all peers to the readset
@@ -863,8 +862,13 @@ int main(int argc, char** argv) {
 		printf("Ran out of active peers, reconnecting.\n");
 		start_peers(peer_addr_list);
 	    }
+	} else {
+	    puts("Download complete.");
+	    fflush(stdout);
+	    break;
 	}
     }
 
+    return 0;
 }
 
