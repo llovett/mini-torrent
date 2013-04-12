@@ -395,81 +395,6 @@ void connect_to_peer(struct peer_addr *peeraddr) {
     print_peer_address(peeraddr);
 }
 
-/* establish a connection to the peer, assuming there isn't already a connection to it.
-
-   In this version, each peer gets a separate thread so connect_to_peer can be written as a
-   single peer-specific loop. For the homework solution, the loop needs to apply to all peers,
-   not just the one.
-*/
-/* void connect_to_peers(struct peer_addr *peeraddr_list, int count) { */
-
-/*     int i; */
-/*     for (i=0; i<count; i++) { */
-/* 	struct peer_addr *peeraddr = &peeraddr_list[i]; */
-/* 	fprintf(stderr,"Connecting...\n"); */
-
-/* 	if(peer_connected(peeraddr->addr)) { */
-/* 	    fprintf(stderr,"Already connected\n"); */
-/* 	    continue; */
-/* 	} */
-
-/* 	int s = socket(AF_INET, SOCK_STREAM, 0); */
-/* 	struct sockaddr_in addr; */
-/* 	addr.sin_family = AF_INET; */
-/* 	addr.sin_addr.s_addr = peeraddr->addr; */
-/* 	addr.sin_port = peeraddr->port; */
-
-/* 	/\* puts("HIHIHIHHI!!!"); *\/ */
-/* 	/\* struct in_addr ipaddr; *\/ */
-/* 	/\* ipaddr.s_addr = peeraddr->addr; *\/ */
-/* 	/\* printf("peer address: IP(%s) PORT(%d)\n", *\/ */
-/* 	/\*        inet_ntoa(ipaddr), *\/ */
-/* 	/\*        peeraddr->port); *\/ */
-
-/* 	/\* after 60 seconds of nothing, we probably should poke the peer to see if we can wake them up *\/ */
-/* 	struct timeval tv; */
-/* 	tv.tv_sec = 60; */
-/* 	if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv,  sizeof tv)) { */
-/* 	    perror("setsockopt"); */
-/* 	    continue; */
-/* 	} */
-
-/* 	int res = connect(s, (struct sockaddr*)&addr, sizeof(addr)); */
-/* 	if(res == -1) { */
-/* 	    fprintf(stderr,"Couldn't connect to %d \n", peeraddr->port); */
-/* 	    fflush(stderr); */
-/* 	    perror("Error while connecting."); */
-/* 	    continue; */
-/* 	} */
-
-/* 	/\* register the new peer in our list of peers *\/ */
-/* 	struct peer_state* peer = calloc(1,sizeof(struct peer_state)); */
-/* 	peer->socket = s; */
-/* 	peer->ip=peeraddr->addr; */
-/* 	peer->next = peers; */
-/* 	peer->connected=0; */
-/* 	peer->choked=1; */
-/* 	peer->incoming=malloc(BUFSIZE); */
-/* 	peer->outgoing=malloc(BUFSIZE); */
-/* 	peer->outgoing_count = 0; */
-/* 	peer->bitfield = calloc(1,file_length/piece_length/8+1); //start with an empty bitfield */
-/* 	peers=peer; */
-
-/* 	// Queue a handshake message for each peer */
-/* 	char protocol[] = "BitTorrent protocol"; */
-/* 	unsigned char pstrlen = strlen(protocol); // not sure if this should be with or without terminator */
-/* 	unsigned char buf[pstrlen+49]; */
-/* 	buf[0]=pstrlen; */
-/* 	memcpy(buf+1,protocol,pstrlen); */
-/* 	memcpy(buf+1+pstrlen+8,digest,20); */
-/* 	memcpy(buf+1+pstrlen+8+20,peer_id,20); */
-/* 	send_message(peer, buf, sizeof(buf)); */
-
-/* 	peeraddr++; */
-/*     } */
-
-/* } */
-
 void receive_handshake(struct peer_state *peer) {
     /* receive the handshake message. This is different from all other messages, making things ugly. */
     if (peer->count < 4 || peer->count < peer->incoming[0]+49) {
@@ -546,7 +471,12 @@ void start_peers(struct peer_addr **addrs) {
 	    }
 	    // the announcement document is in <tmp_name>
 	    // so map that into memory, then call handle_announcement on the returned pointer
-	    handle_announcement(mmap(0,anno_stat.st_size,PROT_READ,MAP_SHARED,open(tmp_name,O_RDONLY),0),
+	    handle_announcement(mmap(0,
+				     anno_stat.st_size,
+				     PROT_READ,
+				     MAP_SHARED,
+				     open(tmp_name,O_RDONLY),
+				     0),
 				anno_stat.st_size);
 	}
 	curl_easy_cleanup(curl);
@@ -666,7 +596,8 @@ void handle_message(struct peer_state *peer) {
 	    printf("Bitfield of length %d\n",msglen-1);
 	int fieldlen = msglen - 1;
 	if(fieldlen != (file_length/piece_length/8+1)) {
-	    fprintf(stderr,"Incorrect bitfield size, expected %d\n",file_length/piece_length/8+1);
+	    fprintf(stderr,"Incorrect bitfield size, expected %d\n",
+		    file_length/piece_length/8+1);
 	    shutdown_peer(peer);
 	}
 	memcpy(peer->bitfield,peer->incoming+5,fieldlen);
@@ -679,7 +610,8 @@ void handle_message(struct peer_state *peer) {
 	int offset = ntohl(*((int*)&peer->incoming[9]));
 	int datalen = msglen - 9;
 
-	fprintf(stderr,"Writing piece %d, offset %d, ending at %d\n",piece,offset,piece*piece_length+offset+datalen);
+	fprintf(stderr,"Writing piece %d, offset %d, ending at %d\n",
+		piece,offset,piece*piece_length+offset+datalen);
 	write_block(peer->incoming+13,piece,offset,datalen,1);
 
 	draw_state();
@@ -760,7 +692,9 @@ int main(int argc, char** argv) {
 	for(int i=0;i<files->n;i++) {
 	    struct bencode* file = files->values[i];
 	    struct bencode_list* path = (struct bencode_list*)ben_dict_get_by_str(file,"path");
-	    printf("Filename %s/%s\n",((struct bencode_str*)ben_dict_get_by_str(info,"name"))->s,((struct bencode_str*)path->values[0])->s);
+	    printf("Filename %s/%s\n",
+		   ((struct bencode_str*)ben_dict_get_by_str(info,"name"))->s,
+		   ((struct bencode_str*)path->values[0])->s);
 
 	    // accumulate a total length so we know how many pieces there are
 	    file_length+=((struct bencode_int*)ben_dict_get_by_str(file,"length"))->ll;
@@ -791,7 +725,9 @@ int main(int argc, char** argv) {
 
 
     // compile a suitable announce URL for our document
-    sprintf(announce_url,"%s?info_hash=%s&peer_id=%s&port=6881&left=%d",((struct bencode_str*)ben_dict_get_by_str((struct bencode*)torrent,"announce"))->s,info_hash,peer_id,file_length);
+    sprintf(announce_url,"%s?info_hash=%s&peer_id=%s&port=6881&left=%d",
+	    ((struct bencode_str*)ben_dict_get_by_str((struct bencode*)torrent,"announce"))->s,
+	    info_hash,peer_id,file_length);
     printf("Announce URL: %s\n",announce_url);
     fflush(stdout);
 
