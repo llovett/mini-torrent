@@ -18,3 +18,9 @@ struct peer_state {
     int count; // number of bytes currently in the incoming buffer
     int choked;
 };
+
+// function defs
+int send_message(struct peer_state *peer, const void *msg, int len);
+void print_bencode(struct bencode*);
+void start_peers(void);
+void handle_announcement(char *ptr, size_t size);
