@@ -483,6 +483,7 @@ void receive_handshake(struct peer_state *peer) {
     // Testing again, since we got rid of the loop. We'll have more chances to receive
     // the whole handshake
     if (peer->count < 4 || peer->count < peer->incoming[0]+49) {
+	puts("dont have the whole handshake yet... going back to loop...");
 	return;
     }
 
@@ -501,7 +502,6 @@ void receive_handshake(struct peer_state *peer) {
 	memmove(peer->incoming,peer->incoming+peer->incoming[0]+49,peer->count);
 
     peer->connected = 1;
-
     struct in_addr inaddr;
     inaddr.s_addr = peer->ip;
     printf("Successfully connected to peer %s!\n", inet_ntoa(inaddr));
@@ -800,6 +800,11 @@ int main(int argc, char** argv) {
     puts("calling start_peers...");
     start_peers(peer_addr_list);
 
+    // Add all peers to the readset
+    for (struct peer_state *peer = peers; peer; peer=peer->next) {
+	FD_SET(peer->socket, &readset);
+    }
+
     /***************/
     /* SELECT LOOP */
     /***************/
@@ -821,6 +826,7 @@ int main(int argc, char** argv) {
 	while (peer) {
 	    if (FD_ISSET(peer->socket, &rtemp)) {
 		if (!peer->connected) {
+		    puts("Attempting to receive handshake");
 		    receive_handshake(peer);
 		} else {
 		    // handle the non-handshake message
