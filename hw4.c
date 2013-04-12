@@ -14,8 +14,6 @@
 #include<netinet/in.h>
 #include<sys/select.h>
 
-#include<pthread.h>
-
 #include"hw4.h"
 
 // Read and write sets of peers
@@ -24,8 +22,6 @@ fd_set readset, writeset;
 // computed in main(). This is where we get our peers from.
 char announce_url[255];
 
-pthread_mutex_t status_lock, file_lock, anno_lock;
-pthread_cond_t finish_cond;
 enum {PIECE_EMPTY=0, PIECE_PENDING=1, PIECE_FINISHED=2} *piece_status;
 
 #define BUFSIZE piece_length*2-1
@@ -58,6 +54,18 @@ void print_peer_address(struct peer_addr *addr) {
 	   inet_ntoa(ipaddr),
 	   addr->port);
     fflush(stdout);
+}
+
+void print_peers() {
+    struct peer_state *peer = peers;
+    while(peer) {
+	struct in_addr inaddr;
+	inaddr.s_addr = peer->ip;
+	printf("peer: IP(%s) SOCKET(%d)\n",
+	       inet_ntoa(inaddr),
+	       peer->socket);
+	peer = peer->next;
+    }
 }
 
 int active_peers() {
@@ -125,7 +133,6 @@ int missing_blocks() {
 
 /* so far, we're assuming that every peer actually have all pieces. That's not good! */
 int next_piece(int previous_piece) {
-    pthread_mutex_lock(&status_lock);
     if(previous_piece!=-1)
 	piece_status[previous_piece]=PIECE_FINISHED;
 
@@ -136,11 +143,9 @@ int next_piece(int previous_piece) {
 	    if(debug)
 		fprintf(stderr,"Next piece %d / %d\n",i,file_length/piece_length);
 	    piece_status[i]=PIECE_PENDING;
-	    pthread_mutex_unlock(&status_lock);
 	    return i;
 	}
     }
-    pthread_mutex_unlock(&status_lock);
     return -1;
 }
 
@@ -149,9 +154,6 @@ int next_piece(int previous_piece) {
 */
 void write_block(char* data, int piece, int offset, int len, int acquire_lock) {
     FILE *outfile;
-
-    if(acquire_lock)
-	pthread_mutex_lock(&file_lock);
 
     int accumulated_file_length = 0;
     int block_start = piece*piece_length+offset;
@@ -200,7 +202,6 @@ void write_block(char* data, int piece, int offset, int len, int acquire_lock) {
 		if(remaining_file_length > len) {
 		    write(outfile,data,len);
 		    close(outfile);
-		    goto cleanup;
 		}
 		else {
 		    if(debug) {
@@ -212,7 +213,6 @@ void write_block(char* data, int piece, int offset, int len, int acquire_lock) {
 		    write(outfile,data,remaining_file_length);
 		    close(outfile);
 		    write_block(data+remaining_file_length,piece,offset+remaining_file_length,len-remaining_file_length,0);
-		    goto cleanup;
 		}
 
 	    }
@@ -237,10 +237,6 @@ void write_block(char* data, int piece, int offset, int len, int acquire_lock) {
 	    exit(1);
 	}
     }
-
-cleanup:
-    if(acquire_lock)
-	pthread_mutex_unlock(&file_lock);
 }
 
 void shutdown_peer(struct peer_state *peer) {
@@ -492,6 +488,7 @@ void receive_handshake(struct peer_state *peer) {
 
     if(memcmp(peer->incoming+peer->incoming[0]+1+8+20,"-OBCS342-",strlen("-OBCS342-"))==0) {
 	fprintf(stderr,"Caught a CS342 peer, exiting.\n");
+	fflush(stdout);
 	shutdown_peer(peer);
     }
 
@@ -507,7 +504,8 @@ void receive_handshake(struct peer_state *peer) {
 
     struct in_addr inaddr;
     inaddr.s_addr = peer->ip;
-    printf("Successfully connected to peer %s!\n", inet_ntoa(inaddr));    
+    printf("Successfully connected to peer %s!\n", inet_ntoa(inaddr));
+    fflush(stdout);
 }
 
 /**
@@ -592,9 +590,6 @@ void handle_announcement(char *ptr, size_t size) {
 	    fflush(stdout);
 
 	    connect_to_peer(&peerlist[i]);
-
-	    /* pthread_t thread; */
-	    /* pthread_create(&thread,0,connect_to_peer,&peerlist[i]); */
 	}
 
     }
@@ -609,17 +604,10 @@ void handle_announcement(char *ptr, size_t size) {
 	    printf("Found peer %s:%d\n",address,port);
 	    fflush(stdout);
 
-	    // pthread_create allows us to pass in one pointer. For the bencoded case, we allocate a new
-	    // peer_addr struct, and pass that in. Note that we can't allocate this on the stack, as it would
-	    // be immediately overwritten before the thread even got started.
-
 	    struct peer_addr addr;
 	    addr.addr = inet_addr(address);
 	    addr.port = htons(port);
 	    connect_to_peer(&addr);
-
-	    /* pthread_t thread; */
-	    /* pthread_create(&thread,0,connect_to_peer,&peeraddr); */
 	}
     }
 }
@@ -788,13 +776,7 @@ int main(int argc, char** argv) {
     fflush(stdout);
     piece_length = ((struct bencode_int*)ben_dict_get_by_str(info,"piece length"))->ll;
 
-    // create our output file, and set up a piece_status array, and a couple of pthread sync. variables
-
     piece_status = calloc(1,sizeof(int)*(int)(file_length/piece_length+1)); //start with an empty bitfield
-    pthread_mutex_init(&status_lock,0);
-    pthread_mutex_init(&file_lock,0);
-    pthread_mutex_init(&anno_lock,0);
-    pthread_cond_init(&finish_cond,0);
 
     /* compute the message digest and info_hash from the "info" field in the torrent */
     size_t len;
@@ -821,6 +803,9 @@ int main(int argc, char** argv) {
     /***************/
     /* SELECT LOOP */
     /***************/
+
+    puts("---------- PEERS ----------");
+    print_peers();
 
     // Select loop goes here
     while (1) {
@@ -866,16 +851,12 @@ int main(int argc, char** argv) {
 
 	// wait for a signal that all the downloading is done
 	if (missing_blocks()>0) {
-	    pthread_mutex_lock(&status_lock);
-	    pthread_cond_wait(&finish_cond,&status_lock);
 	    fprintf(stderr,"One iteration finished, %d active peers, %d missing blocks\n",active_peers(),missing_blocks());
 
 	    if(active_peers()==0 && missing_blocks()>0) {
 		printf("Ran out of active peers, reconnecting.\n");
 		start_peers(peer_addr_list);
 	    }
-
-	    pthread_mutex_unlock(&status_lock);
 	}
     }
 
