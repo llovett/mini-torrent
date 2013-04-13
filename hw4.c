@@ -491,7 +491,8 @@ void handle_message(struct peer_state *peer) {
 	int offset = ntohl(*((int*)&peer->incoming[9]));
 	int datalen = msglen - 9;
 
-	fprintf(stderr,"Writing piece %d, offset %d, ending at %d\n",piece,offset,piece*piece_length+offset+datalen);
+	fprintf(stderr,"Writing piece %d, offset %d, ending at %d\n",
+		piece,offset,piece*piece_length+offset+datalen);
 	write_block(peer->incoming+13,piece,offset,datalen,1);
 
 	draw_state();
@@ -503,9 +504,17 @@ void handle_message(struct peer_state *peer) {
 
 	    peer->requested_piece=next_piece(peer, piece, &offset);
 
-	    if(peer->requested_piece==-1) {
-		fprintf(stderr,"No more pieces to download!\n");
-		shutdown_peer(peer);
+	    // Send HAVE messages to each of our connected peers for this piece
+	    struct {
+	    	int len;
+	    	char id;
+	    	int index;
+	    } __attribute__((packed)) have;
+	    have.len = htonl(5);
+	    have.id = 4;
+	    have.index = htonl(piece);
+	    for (struct peer_state *peer=peers; peer && peer->connected; peer=peer->next) {
+	    	buffer_message(peer, &have, sizeof(have));
 	    }
 	}
 
