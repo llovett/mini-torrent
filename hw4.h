@@ -6,6 +6,7 @@ struct peer_addr {
 struct peer_state {
     struct peer_state *next;
     in_addr_t ip;
+    int port;
 
     int socket;
     int connected;

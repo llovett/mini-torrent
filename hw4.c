@@ -65,10 +65,10 @@ int choked_peers() {
     return count;
 }
 
-int peer_connected(in_addr_t addr) {
+int peer_connected(in_addr_t addr, int port) {
     struct peer_state *peer = peers;
     while(peer) {
-	if(peer->ip == addr && peer->connected==1) {
+	if(peer->ip == addr && peer->port == port && peer->connected==1) {
 	    return 1;
 	}
 	peer = peer->next;
@@ -316,7 +316,7 @@ void shutdown_peer(struct peer_state *peer) {
 void connect_to_peer(struct peer_addr *peeraddr) {
     fprintf(stderr,"Connecting...\n");
 
-    if(peer_connected(peeraddr->addr)) {
+    if(peer_connected(peeraddr->addr, peeraddr->port)) {
 	fprintf(stderr,"Already connected\n");
 	return;
     }
@@ -357,6 +357,7 @@ void connect_to_peer(struct peer_addr *peeraddr) {
     struct peer_state* peer = calloc(1,sizeof(struct peer_state));
     peer->socket = s;
     peer->ip=peeraddr->addr;
+    peer->port=peeraddr->port;
     peer->next = peers;
     peer->connected=0;
     peer->rcv_handshake = 0;
@@ -701,11 +702,7 @@ int main(int argc, char** argv) {
 		int msgsize = peer->outgoing_count;
 		int sent_bytes = send(peer->socket, peer->outgoing, msgsize, MSG_NOSIGNAL);
 		if (sent_bytes < 0) {
-		    perror("send");
-		    printf("Bad file descriptor? SOCKET(%d) CONNECTED(%d) CHOKED(%d)\n",
-			   peer->socket, peer->connected, peer->choked);
-		    // Experimental:
-		    shutdown_peer(peer);
+		    // Problem with send... let's ignore it!!! :)
 		    continue;
 		}
 		memmove(peer->outgoing, peer->outgoing+sent_bytes, peer->outgoing_count-sent_bytes);
