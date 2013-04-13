@@ -6,6 +6,7 @@ struct peer_addr {
 struct peer_state {
     struct peer_state *next;
     in_addr_t ip;
+    int port;
 
     int socket;
     int connected;
@@ -14,6 +15,7 @@ struct peer_state {
     char *outgoing; // buffer for messages going out to this peer
     int outgoing_count; // number of bytes to be sent to this peer
     int requested_piece;
+    int received_handshake;
 
     int count; // number of bytes currently in the incoming buffer
     int choked;

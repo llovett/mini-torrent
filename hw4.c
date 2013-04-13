@@ -15,6 +15,11 @@
 #include<sys/select.h>
 #include"hw4.h"
 
+#define PRINT(x) if(debug){puts(x);fflush(stdout);}
+
+// Greatest-numbered FD so far
+int maxfd = -1;
+
 // Read and write sets of peers
 fd_set readset, writeset;
 
@@ -24,7 +29,7 @@ char announce_url[255];
 enum {PIECE_EMPTY=0, PIECE_PENDING=1, PIECE_FINISHED=2} *piece_status;
 
 #define BUFSIZE piece_length*2-1
-struct peer_state *peers=NULL;
+struct peer_state *peers=0;
 
 int debug=1;  //set this to zero if you don't want all the debugging messages
 
@@ -67,7 +72,18 @@ int active_peers() {
     struct peer_state *peer = peers;
     int count=0;
     while(peer) {
-	if(peer->connected && !peer->choked)
+	if((peer->connected && !peer->choked) || !peer->received_handshake)
+	    count++;
+	peer = peer->next;
+    }
+    return count;
+}
+
+int connected_peers() {
+    struct peer_state *peer = peers;
+    int count=0;
+    while(peer) {
+	if((peer->connected && !peer->choked))
 	    count++;
 	peer = peer->next;
     }
@@ -85,10 +101,10 @@ int choked_peers() {
     return count;
 }
 
-int peer_connected(in_addr_t addr) {
+int peer_connected(struct peer_addr *addr) {
     struct peer_state *peer = peers;
     while(peer) {
-	if(peer->ip == addr && peer->connected==1) {
+	if(peer->ip == addr->addr && peer->port == addr->port && peer->connected==1) {
 	    return 1;
 	}
 	peer = peer->next;
@@ -235,9 +251,14 @@ void write_block(char* data, int piece, int offset, int len, int acquire_lock) {
 }
 
 void shutdown_peer(struct peer_state *peer) {
+    struct in_addr inaddr;
+    inaddr.s_addr = peer->ip;
+    printf("Shutting down peer: PEER(%x) SOCKET(%d) IP(%s)\n",
+	   peer, peer->socket, inet_ntoa(inaddr));
     close(peer->socket);
     peer->connected = 0;
     FD_CLR(peer->socket, &readset);
+    FD_CLR(peer->socket, &writeset);
 }
 
 /* Wait for peer to send us a message (could be a partial message!)
@@ -246,6 +267,13 @@ void shutdown_peer(struct peer_state *peer) {
  *	message length, if a full message is ready
  **/
 int receive_message(struct peer_state* peer) {
+    printf("Receiving a message from a %s peer --- SOCKET(%d) CHOKED(%d)...\n",
+	   peer->connected? "connected" : "unconnected",
+	   peer->socket,
+	   peer->choked);
+    fflush(stdout);
+    // First four bytes = length of message
+    // Test to see if we have all of the message
     if (peer->count<4 || ntohl(((int*)peer->incoming)[0])+4 > peer->count) {
 	int newbytes=recv(peer->socket,peer->incoming+peer->count,BUFSIZE-peer->count,0);
 	if(newbytes == 0) {
@@ -254,8 +282,7 @@ int receive_message(struct peer_state* peer) {
 	}
 	else if(newbytes < 0) {
 	    perror("Problem when receiving more bytes, closing socket");
-	    close(peer->socket);
-	    peer->connected = 0;
+	    shutdown_peer(peer);
 	    return 0;
 	}
 	peer->count+=newbytes;
@@ -305,8 +332,8 @@ void request_block(struct peer_state* peer, int piece, int offset) {
     // no point in sending anything if we got choked. We'll restart on unchoke.
     // WARNING: not handling the case where we get choked in the middle of a piece! Does this happen?
     if(!peer->choked) {
-	/* send_message(peer,&request,sizeof(request)); */
-	send(peer->socket,&request,sizeof(request),0);
+	send_message(peer,&request,sizeof(request));
+	/* send(peer->socket,&request,sizeof(request),0); */
     }
     else
 	fprintf(stderr,"Not sending, choked!\n");
@@ -327,17 +354,22 @@ void send_interested(struct peer_state* peer) {
     msg.len = htonl(1);
     msg.id = 2;
 
-   /* send_message(peer,&msg,sizeof(msg)); */
-    send(peer->socket,&msg,sizeof(msg),0);
+    send_message(peer,&msg,sizeof(msg));
+    /* send(peer->socket,&msg,sizeof(msg),0); */
 }
 
 void connect_to_peer(struct peer_addr *peeraddr) {
-    if(peer_connected(peeraddr->addr)) {
+    if(peer_connected(peeraddr)) {
 	fprintf(stderr,"Already connected\n");
 	return;
     }
 
     int s = socket(AF_INET, SOCK_STREAM, 0);
+    // Check for greatest socket FD
+    if (s > maxfd) {
+	maxfd = s;
+    }
+    
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = peeraddr->addr;
@@ -369,6 +401,7 @@ void connect_to_peer(struct peer_addr *peeraddr) {
     struct peer_state* peer = calloc(1,sizeof(struct peer_state));
     peer->socket = s;
     peer->ip=peeraddr->addr;
+    peer->port=peeraddr->port;
     peer->next = peers;
     peer->connected=0;
     peer->choked=1;
@@ -376,6 +409,7 @@ void connect_to_peer(struct peer_addr *peeraddr) {
     peer->outgoing=malloc(BUFSIZE);
     peer->outgoing_count = 0;
     peer->count = 0;
+    peer->received_handshake = 0;
     peer->bitfield = calloc(1,file_length/piece_length/8+1); //start with an empty bitfield
     peers=peer;
 
@@ -424,6 +458,7 @@ void receive_handshake(struct peer_state *peer) {
 	memmove(peer->incoming,peer->incoming+peer->incoming[0]+49,peer->count);
 
     peer->connected = 1;
+    peer->received_handshake = 1;
     struct in_addr inaddr;
     inaddr.s_addr = peer->ip;
     printf("Successfully connected to peer %s!\n", inet_ntoa(inaddr));
@@ -497,13 +532,6 @@ void handle_announcement(char *ptr, size_t size) {
 
     struct bencode_list *peer_addrs = (struct bencode_list*)ben_dict_get_by_str(anno,"peers");
 
-    /* unfortunately, the list of peers could be either in bencoded format, or in binary format.
-       the binary format value is passed as a string, bencoded format is passed as a list.
-       We handle the two cases separately below.
-
-       For each peer, we start a new thread to connect to the peer. Your solution is not allowed
-       to use threads.
-    */
     // handle the binary case
     if(peer_addrs->type == BENCODE_STR) {
 	// the "string" in peers is really a list of peer_addr structs, so we'll just cast it as such
@@ -541,21 +569,11 @@ void handle_announcement(char *ptr, size_t size) {
 void handle_message(struct peer_state *peer) {
     int newbytes=0;
     int msglen = ntohl(((int*)peer->incoming)[0]);
-    
-    fflush(stdout);
-    if(msglen == 0) {
-	peer->connected = 0;
-	close(peer->socket);
-	piece_status[peer->requested_piece]=PIECE_EMPTY;
-	draw_state();
-	shutdown_peer(peer);
-    };
 
     switch(peer->incoming[4]) {
 	// CHOKE
     case 0: {
-	if(debug)
-	    fprintf(stderr,"Choke\n");
+	PRINT("Choke!");
 	peer->choked = 1;
 	piece_status[peer->requested_piece]=PIECE_EMPTY;
 	peer->requested_piece = -1;
@@ -564,7 +582,7 @@ void handle_message(struct peer_state *peer) {
 	// UNCHOKE
     case 1: {
 	if(debug)
-	    fprintf(stderr,"Unchoke\n");
+	    PRINT("unchoke!!!");
 	peer->choked = 0;
 
 	// grab a new piece - WARNING: this assumes that you don't get choked mid-piece!
@@ -574,6 +592,7 @@ void handle_message(struct peer_state *peer) {
     }
 	// HAVE -- update the bitfield for this peer
     case 4: {
+	PRINT("Have!");
 	int piece_index = ntohl(*((int*)&peer->incoming[5]));
 	int bitfield_byte = piece_index/8;
 	int bitfield_bit = 7-(piece_index%8);
@@ -587,9 +606,12 @@ void handle_message(struct peer_state *peer) {
     }
 	// BITFIELD -- set the bitfield for this peer
     case 5:
+	PRINT("Bitfield!");
 	peer->choked = 0; // let's assume a bitfield means we're allowed to go...
-	if(debug)
+	if(debug){
 	    printf("Bitfield of length %d\n",msglen-1);
+	    fflush(stdout);
+	}
 	int fieldlen = msglen - 1;
 	if(fieldlen != (file_length/piece_length/8+1)) {
 	    fprintf(stderr,"Incorrect bitfield size, expected %d\n",
@@ -600,8 +622,14 @@ void handle_message(struct peer_state *peer) {
 
 	send_interested(peer);
 	break;
+	// REQUEST
+    case 6: {
+	PRINT("Received a request. No way!");
+	break;
+    }
 	// PIECE
     case 7: {
+	PRINT("Piece!");
 	int piece = ntohl(*((int*)&peer->incoming[5]));
 	int offset = ntohl(*((int*)&peer->incoming[9]));
 	int datalen = msglen - 9;
@@ -624,9 +652,8 @@ void handle_message(struct peer_state *peer) {
 		fprintf(stderr,"No more pieces to download!\n");
 
 		// don't exit if some piece is still being downloaded
-		for(int i=0;i<file_length/piece_length+1;i++)
-		    if(piece_status[i]!=2)
-			shutdown_peer(peer);
+		/* for(int i=0;i<file_length/piece_length+1;i++) */
+		/*     if(piece_status[i]!=2) */
 		shutdown_peer(peer);
 	    }
 	}
@@ -637,8 +664,9 @@ void handle_message(struct peer_state *peer) {
 
     case 20:
 	printf("Extended type is %d\n",peer->incoming[5]);
-	struct bencode *extended = ben_decode(peer->incoming,msglen);
-	print_bencode(extended);
+	fflush(stdout);
+	/* struct bencode *extended = ben_decode(peer->incoming,msglen); */
+	/* print_bencode(extended); */
 	break;
     }
 
@@ -750,28 +778,24 @@ int main(int argc, char** argv) {
 
 	puts("selecting!");
 	fflush(stdout);
-	int selected = select(FD_SETSIZE, &rtemp, &wtemp, NULL, 0);
+	int selected = select(maxfd, &rtemp, &wtemp, NULL, 0);
 
 	struct peer_state *peer = peers;
 	while (peer) {
-	    if (FD_ISSET(peer->socket, &rtemp)) {
-		if (!peer->connected) {
-		    receive_handshake(peer);
-		} else {
-		    // handle the non-handshake message
-		    int msglen = 0;
-		    if ((msglen = receive_message(peer))) {
-			handle_message(peer);
-		    }
-		}
-	    } else if (FD_ISSET(peer->socket, &wtemp)) {
+	    if (FD_ISSET(peer->socket, &wtemp) &&
+		(!peer->received_handshake || peer->connected)) {
 		int msgsize = peer->outgoing_count;
 		fflush(stdout);
-		int sent_bytes = send(peer->socket, peer->outgoing, msgsize, 0);
+		PRINT("Attempting to write to peer");
+		int sent_bytes = send(peer->socket, peer->outgoing, msgsize, MSG_NOSIGNAL);
+		PRINT("Wrote to peer.");
 		fflush(stdout);
 		if (sent_bytes == -1) {
+		    printf("peer with bad file descriptor? PEER(%x) SOCKET(%d) OUTGOING_COUNT(%d)\n",
+			   peer, peer->socket, peer->outgoing_count);
+		    fflush(stdout);
 		    perror("send");
-		    exit(1);
+		    /* exit(1); */
 		}
 		memmove(peer->outgoing, peer->outgoing+sent_bytes, peer->outgoing_count-sent_bytes);
 		peer->outgoing_count -= sent_bytes;
@@ -779,12 +803,27 @@ int main(int argc, char** argv) {
 		    FD_CLR(peer->socket, &writeset);
 		}
 	    }
+	    if (FD_ISSET(peer->socket, &rtemp)) {
+		PRINT("Attempting to read from peer");
+		if (!peer->connected) {
+		    PRINT("Reading handshake");
+		    receive_handshake(peer);
+		} else {
+		    PRINT("Handling non-handshake message");
+		    // handle the non-handshake message
+		    int msglen = 0;
+		    if ((msglen = receive_message(peer))) {
+			PRINT("message received. calling handle_message...");
+			handle_message(peer);
+		    }
+		}
+	    } 
 	    peer = peer->next;
 	}
 
 	// wait for a signal that all the downloading is done
 	if (missing_blocks()>0) {
-	    fprintf(stderr,"One iteration finished, %d active peers, %d missing blocks\n",active_peers(),missing_blocks());
+	    fprintf(stderr,"One iteration finished, %d active peers, %d missing blocks\n",connected_peers(),missing_blocks());
 
 	    if(active_peers()==0 && missing_blocks()>0) {
 		printf("Ran out of active peers, reconnecting.\n");
