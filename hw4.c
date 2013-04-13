@@ -142,7 +142,7 @@ int next_piece(struct peer_state *peer, int previous_piece, int *offset) {
 /* This needs to be fixed to work properly for multi-file torrents.
    specifically, it needs to create the proper directory structure, rather than just concatenate directory and file names.
 */
-void write_block(char* data, int piece, int offset, int len, int acquire_lock) {
+void write_block(char* data, int piece, int offset, int len) {
     FILE *outfile;
 
     int accumulated_file_length = 0;
@@ -202,7 +202,7 @@ void write_block(char* data, int piece, int offset, int len, int acquire_lock) {
 
 		    write(outfile,data,remaining_file_length);
 		    close(outfile);
-		    write_block(data+remaining_file_length,piece,offset+remaining_file_length,len-remaining_file_length,0);
+		    write_block(data+remaining_file_length,piece,offset+remaining_file_length,len-remaining_file_length);
 		}
 
 	    }
@@ -233,6 +233,99 @@ void write_block(char* data, int piece, int offset, int len, int acquire_lock) {
 	}
     }
 }
+
+void read_block(char* data, int piece, int offset, int len) {
+    FILE *outfile;
+
+    int accumulated_file_length = 0;
+    int block_start = piece*piece_length+offset;
+
+    struct bencode_list* files = (struct bencode_list*)ben_dict_get_by_str(info,"files");
+    // multi-file case
+    if(files) {
+	for(int i=0;i<files->n;i++) {
+	    struct bencode* file = files->values[i];
+	    struct bencode_list* path = (struct bencode_list*)ben_dict_get_by_str(file,"path");
+	    //			printf("Filename %s/%s\n",((struct bencode_str*)ben_dict_get_by_str(info,"name"))->s,((struct bencode_str*)path->values[0])->s);
+	    // accumulate a total length so we know how many pieces there are
+	    int file_length=((struct bencode_int*)ben_dict_get_by_str(file,"length"))->ll;
+
+	    printf("start %d len %d accum %d filelen %d\n",block_start,len,accumulated_file_length,file_length);
+	    fflush(stdout);
+	    // at least part of the block belongs in this file
+	    if((block_start >= accumulated_file_length) && (block_start < accumulated_file_length+file_length)) {
+		char filename[255];
+
+		mkdir(((struct bencode_str*)ben_dict_get_by_str(info,"name"))->s,0777);
+		chmod(((struct bencode_str*)ben_dict_get_by_str(info,"name"))->s,07777);
+
+		sprintf(filename,"%s/",((struct bencode_str*)ben_dict_get_by_str(info,"name"))->s);
+		for(int j=0;j<path->n;j++) {
+		    if(j<(path->n-1)) {
+			sprintf(filename+strlen(filename),"%s/",((struct bencode_str*)path->values[j])->s);
+			mkdir(filename,0777);
+			chmod(filename,07777);
+		    }
+		    else
+			sprintf(filename+strlen(filename),"%s",((struct bencode_str*)path->values[j])->s);
+		}
+
+		int outfile = open(filename,O_RDWR|O_CREAT,0777);
+		if(outfile == -1) {
+		    fprintf(stderr,"filename: %s\n",filename);
+		    perror("Couldn't open file for writing");
+		    exit(1);
+		}
+
+		int offset_into_file = block_start - accumulated_file_length;
+		int remaining_file_length = file_length - offset_into_file;
+		lseek(outfile,offset_into_file,SEEK_SET);
+
+		if(remaining_file_length > len) {
+		    write(outfile,data,len);
+		    close(outfile);
+		}
+		else {
+		    if(debug) {
+			fprintf(stderr,"Uh-oh, write crossing file boundaries... watch out!\n");
+			fprintf(stderr,"Len %d offset %d filelen %d remaining file len %d\n",len,offset_into_file,file_length,remaining_file_length);
+			fflush(stdout);
+		    }
+
+		    write(outfile,data,remaining_file_length);
+		    close(outfile);
+		    write_block(data+remaining_file_length,piece,offset+remaining_file_length,len-remaining_file_length);
+		}
+
+	    }
+	    accumulated_file_length+=file_length;
+	}
+    }
+    // single-file case
+    else {
+
+	struct bencode_str* name = (struct bencode_str*)ben_dict_get_by_str(info,"name");
+	if(name) {
+
+	    int outfile = open(name->s,O_RDWR|O_CREAT,0777);
+
+
+	    file_length = ((struct bencode_int*)ben_dict_get_by_str(info,"length"))->ll;
+
+	    // write the data to the right spot in the file
+	    lseek(outfile,piece*piece_length+offset,SEEK_SET);
+	    write(outfile, data,len);
+	    close(outfile);
+
+
+	}
+	else {
+	    printf("No name?\n");
+	    exit(1);
+	}
+    }
+}
+
 
 void buffer_message(struct peer_state *peer, const void *msg, int len) {
     memcpy(peer->outgoing+peer->outgoing_count, msg, len);
@@ -344,7 +437,7 @@ void connect_to_peer(struct peer_addr *peeraddr) {
 
     /* after 60 seconds of nothing, we probably should poke the peer to see if we can wake them up */
     struct timeval tv;
-    tv.tv_sec = 60;
+    tv.tv_sec = 1;
     tv.tv_usec = 0;
     if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv,  sizeof tv)) {
 	perror("setsockopt");
@@ -424,17 +517,7 @@ void receive_handshake(struct peer_state *peer) {
 void handle_message(struct peer_state *peer) {
     int newbytes=0;
 
-    int msglen = receive_message(peer);
-
-    fflush(stdout);
-    if(msglen == 0) {
-	peer->connected = 0;
-	close(peer->socket);
-	piece_status[peer->requested_piece].status=PIECE_EMPTY;
-	draw_state();
-	shutdown_peer(peer);
-	return;
-    };
+    int msglen = ntohl(((int*)peer->incoming)[0]);
 
     switch(peer->incoming[4]) {
 	// CHOKE
@@ -485,6 +568,11 @@ void handle_message(struct peer_state *peer) {
 
 	send_interested(peer);
 	break;
+	// REQUEST
+    case 6: {
+	PRINT("Request!");
+	break;
+    }
 	// PIECE
     case 7: {
 	int piece = ntohl(*((int*)&peer->incoming[5]));
@@ -493,7 +581,7 @@ void handle_message(struct peer_state *peer) {
 
 	fprintf(stderr,"Writing piece %d, offset %d, ending at %d\n",
 		piece,offset,piece*piece_length+offset+datalen);
-	write_block(peer->incoming+13,piece,offset,datalen,1);
+	write_block(peer->incoming+13,piece,offset,datalen);
 
 	draw_state();
 	offset+=datalen;
@@ -513,8 +601,15 @@ void handle_message(struct peer_state *peer) {
 	    have.len = htonl(5);
 	    have.id = 4;
 	    have.index = htonl(piece);
-	    for (struct peer_state *peer=peers; peer && peer->connected; peer=peer->next) {
-	    	buffer_message(peer, &have, sizeof(have));
+	    struct peer_state *peer = peers;
+	    while (peer) {
+		if (peer->connected && !peer->choked) {
+		    printf("Sent >>> HAVE(%d) to PEER_SOCKET(%d)\n",
+			   piece, peer->socket);
+		    fflush(stdout);
+		    buffer_message(peer, &have, sizeof(have));
+		}
+		peer = peer->next;
 	    }
 	}
 
@@ -715,9 +810,10 @@ int main(int argc, char** argv) {
 	memcpy(&wtemp, &writeset, sizeof(fd_set));
 
 	int selected = select(FD_SETSIZE, &rtemp, &wtemp, NULL, 0);
+	// If we time out, try reconnecting to the peers
+	    
 	if (selected < 0) {
 	    perror("select");
-	    /* exit(1); */
 	}
 
 	struct peer_state *peer = peers;
@@ -727,16 +823,23 @@ int main(int argc, char** argv) {
 		int msgsize = peer->outgoing_count;
 		int sent_bytes = send(peer->socket, peer->outgoing, msgsize, MSG_NOSIGNAL);
 		if (sent_bytes < 0) {
-		    // Problem with send... let's ignore it!!! :)
-		    continue;
-		}
-		memmove(peer->outgoing, peer->outgoing+sent_bytes, peer->outgoing_count-sent_bytes);
-		peer->outgoing_count -= sent_bytes;
-		if (peer->outgoing_count == 0) {
-		    FD_CLR(peer->socket, &writeset);
+		    // Problem with send...
+		    // Get ridda this peer?
+		    shutdown_peer(peer);
+		    perror("send");
+		    printf("%d active peers remaining.\n",
+		    	   active_peers());
+		    fflush(stdout);
+		} else {
+		    memmove(peer->outgoing, peer->outgoing+sent_bytes, peer->outgoing_count-sent_bytes);
+		    peer->outgoing_count -= sent_bytes;
+		    if (peer->outgoing_count == 0) {
+			FD_CLR(peer->socket, &writeset);
+		    }
 		}
 	    }
-	    if (FD_ISSET(peer->socket, &rtemp)) {
+	    if (FD_ISSET(peer->socket, &rtemp) &&
+		(peer->connected || !peer->rcv_handshake)) {
 		if (!peer->connected) {
 		    receive_handshake(peer);
 		} else if (receive_message(peer)) {
