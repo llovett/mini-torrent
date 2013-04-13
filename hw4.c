@@ -22,8 +22,6 @@ fd_set readset, writeset;
 // computed in main(). This is where we get our peers from.
 char announce_url[255];
 
-enum {PIECE_EMPTY=0, PIECE_PENDING=1, PIECE_FINISHED=2} *piece_status;
-
 #define BUFSIZE piece_length*2-1
 struct peer_state *peers=0;
 
@@ -84,7 +82,7 @@ void* draw_state() {
     for(int i=0;i<pieces;i++) {
 	if(i%80 == 0) printf("\n");
 
-	switch(piece_status[i]) {
+	switch(piece_status[i].status) {
 	case PIECE_EMPTY: printf("."); break;
 	case PIECE_PENDING: printf("x"); break;
 	case PIECE_FINISHED: printf("X"); break;
@@ -99,7 +97,7 @@ int missing_blocks() {
     int count=0;
 
     for(int i=0;i<file_length/piece_length+((file_length%piece_length)>0?1:0);i++) {
-	if(piece_status[i]!=PIECE_FINISHED) {
+	if(piece_status[i].status!=PIECE_FINISHED) {
 	    count++;
 	}
     }
@@ -117,21 +115,25 @@ int next_piece(struct peer_state *peer, int previous_piece, int *offset) {
     // Mark previous piece as finished downloading,
     // -1 means no previous piece (e.g., peer was just unchoked)
     if(previous_piece!=-1)
-	piece_status[previous_piece]=PIECE_FINISHED;
+	piece_status[previous_piece].status=PIECE_FINISHED;
 
     draw_state();
 
     // Find the next piece to ask for
     for(int i=0;i<(file_length/piece_length+1);i++) {
 	// Found a piece that is completely empty and that the peer actually has
-	if (piece_status[i]==PIECE_EMPTY && has_piece(peer,i)) {
+	if (piece_status[i].status==PIECE_EMPTY && has_piece(peer,i)) {
 	    if(debug)
 		fprintf(stderr,"Next piece %d / %d\n",i,file_length/piece_length);
-	    piece_status[i]=PIECE_PENDING;
+	    piece_status[i].status=PIECE_PENDING;
+	    *offset = 0;
 	    return i;
 	}
-	if (piece_status[i]==PIECE_PENDING && has_piece(peer,i)) {
-	    
+	// Found a piece partially downloaded.
+	// Request piece starting at the last byte we received.
+	if (piece_status[i].status==PIECE_PENDING && has_piece(peer,i)) {
+	    *offset = piece_status[i].offset;
+	    return i;
 	}
     }
     return -1;
@@ -421,14 +423,14 @@ void receive_handshake(struct peer_state *peer) {
 
 void handle_message(struct peer_state *peer) {
     int newbytes=0;
-    
+
     int msglen = receive_message(peer);
 
     fflush(stdout);
     if(msglen == 0) {
 	peer->connected = 0;
 	close(peer->socket);
-	piece_status[peer->requested_piece]=PIECE_EMPTY;
+	piece_status[peer->requested_piece].status=PIECE_EMPTY;
 	draw_state();
 	shutdown_peer(peer);
 	return;
@@ -440,7 +442,7 @@ void handle_message(struct peer_state *peer) {
 	if(debug)
 	    fprintf(stderr,"Choke\n");
 	peer->choked = 1;
-	piece_status[peer->requested_piece]=PIECE_EMPTY;
+	piece_status[peer->requested_piece].status=PIECE_EMPTY;
 	peer->requested_piece = -1;
 	break;
     }
@@ -499,7 +501,6 @@ void handle_message(struct peer_state *peer) {
 	    if(debug)
 		fprintf(stderr,"Reached end of piece %d at offset %d\n",piece,offset);
 
-	    offset = 0;
 	    peer->requested_piece=next_piece(peer, piece, &offset);
 
 	    if(peer->requested_piece==-1) {
@@ -669,7 +670,8 @@ int main(int argc, char** argv) {
     fflush(stdout);
     piece_length = ((struct bencode_int*)ben_dict_get_by_str(info,"piece length"))->ll;
 
-    piece_status = calloc(1,sizeof(int)*(int)(file_length/piece_length+1)); //start with an empty bitfield
+    //start with an empty bitfield
+    piece_status = calloc(1,sizeof(struct piece_status_t)*(int)(file_length/piece_length+1));
 
     /* compute the message digest and info_hash from the "info" field in the torrent */
     size_t len;

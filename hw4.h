@@ -21,6 +21,11 @@ struct peer_state {
     int choked;
 };
 
+struct piece_status_t {
+    enum {PIECE_EMPTY=0, PIECE_PENDING=1, PIECE_FINISHED=2} status;
+    unsigned int offset;
+} *piece_status;
+
 // Function defs
 void print_bencode(struct bencode*);
 void start_peers();
