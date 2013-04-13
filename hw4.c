@@ -106,19 +106,32 @@ int missing_blocks() {
     return count;
 }
 
-/* so far, we're assuming that every peer actually have all pieces. That's not good! */
-int next_piece(int previous_piece) {
+/**
+ * checks to see if the <peer> has piece number <piece>
+ * */
+int has_piece(struct peer_state *peer, int piece) {
+    return ((peer->bitfield[piece/8]>>(7-(piece%8)))&1);
+}
+
+int next_piece(struct peer_state *peer, int previous_piece, int *offset) {
+    // Mark previous piece as finished downloading,
+    // -1 means no previous piece (e.g., peer was just unchoked)
     if(previous_piece!=-1)
 	piece_status[previous_piece]=PIECE_FINISHED;
 
     draw_state();
 
+    // Find the next piece to ask for
     for(int i=0;i<(file_length/piece_length+1);i++) {
-	if(piece_status[i]==PIECE_EMPTY) {
+	// Found a piece that is completely empty and that the peer actually has
+	if (piece_status[i]==PIECE_EMPTY && has_piece(peer,i)) {
 	    if(debug)
 		fprintf(stderr,"Next piece %d / %d\n",i,file_length/piece_length);
 	    piece_status[i]=PIECE_PENDING;
 	    return i;
+	}
+	if (piece_status[i]==PIECE_PENDING && has_piece(peer,i)) {
+	    
 	}
     }
     return -1;
@@ -369,7 +382,7 @@ void connect_to_peer(struct peer_addr *peeraddr) {
     peers=peer;
 
     //TODO: buffer handshake message before send!
-    buffer_message(peer, &buf, sizeof(buf));
+    buffer_message(peer, buf, sizeof(buf));
 }
 
 void receive_handshake(struct peer_state *peer) {
@@ -438,8 +451,9 @@ void handle_message(struct peer_state *peer) {
 	peer->choked = 0;
 
 	// grab a new piece - WARNING: this assumes that you don't get choked mid-piece!
-	peer->requested_piece = next_piece(-1);
-	request_block(peer,peer->requested_piece,0);
+	int offset = 0;
+	peer->requested_piece = next_piece(peer, -1, &offset);
+	request_block(peer,peer->requested_piece, offset);
 	break;
     }
 	// HAVE -- update the bitfield for this peer
@@ -485,8 +499,8 @@ void handle_message(struct peer_state *peer) {
 	    if(debug)
 		fprintf(stderr,"Reached end of piece %d at offset %d\n",piece,offset);
 
-	    peer->requested_piece=next_piece(piece);
 	    offset = 0;
+	    peer->requested_piece=next_piece(peer, piece, &offset);
 
 	    if(peer->requested_piece==-1) {
 		fprintf(stderr,"No more pieces to download!\n");
