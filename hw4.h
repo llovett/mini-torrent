@@ -31,3 +31,6 @@ void print_bencode(struct bencode*);
 void start_peers();
 void buffer_message(struct peer_state *peer, const void *msg, int len);
 void shutdown_peer(struct peer_state *peer);
+
+// A few constants
+#define MAX_CURL_ATTEMPTS 50

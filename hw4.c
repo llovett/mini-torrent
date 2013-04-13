@@ -339,6 +339,7 @@ int receive_message(struct peer_state* peer) {
 	int newbytes=recv(peer->socket,peer->incoming+peer->count,BUFSIZE-peer->count,0);
 	if(newbytes == 0) {
 	    // Connection closed by peer
+	    shutdown_peer(peer);
 	    return 0;
 	}
 	else if(newbytes < 0) {
@@ -430,6 +431,10 @@ void connect_to_peer(struct peer_addr *peeraddr) {
     }
 
     int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) {
+	perror("socket");
+	exit(1);
+    }
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = peeraddr->addr;
@@ -441,6 +446,8 @@ void connect_to_peer(struct peer_addr *peeraddr) {
     tv.tv_usec = 0;
     if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv,  sizeof tv)) {
 	perror("setsockopt");
+	fprintf(stderr, "Failed trying to connect to socket %d.\n", s);
+	fflush(stderr);
 	return;
     }
 
@@ -518,6 +525,11 @@ void handle_message(struct peer_state *peer) {
     int newbytes=0;
 
     int msglen = ntohl(((int*)peer->incoming)[0]);
+    if (msglen <= 0) {
+	PRINT("Peer closed the connection.");
+	shutdown_peer(peer);
+	return;
+    }
 
     switch(peer->incoming[4]) {
 	// CHOKE
@@ -539,6 +551,22 @@ void handle_message(struct peer_state *peer) {
 	int offset = 0;
 	peer->requested_piece = next_piece(peer, -1, &offset);
 	request_block(peer,peer->requested_piece, offset);
+	break;
+    }
+	// INTERESTED
+    case 2: {
+	PRINT("Interested!");
+
+	// TODO:send an unchoke message:
+	/*
+	 *  struct {
+	 *    int len;
+	 *    char id;
+	 *  } __attribute__((packed)) msg;
+	 *  msg.len = htonl(1);
+	 *  msg.id = 1;
+	 *
+	 **/ 
 	break;
     }
 	// HAVE -- update the bitfield for this peer
@@ -603,13 +631,13 @@ void handle_message(struct peer_state *peer) {
 	    have.index = htonl(piece);
 	    struct peer_state *peer = peers;
 	    while (peer) {
-		if (peer->connected && !peer->choked) {
-		    printf("Sent >>> HAVE(%d) to PEER_SOCKET(%d)\n",
-			   piece, peer->socket);
-		    fflush(stdout);
-		    buffer_message(peer, &have, sizeof(have));
-		}
-		peer = peer->next;
+	    	if (peer->connected && !peer->choked) {
+	    	    printf("Sent >>> HAVE(%d) to PEER_SOCKET(%d)\n",
+	    		   piece, peer->socket);
+	    	    fflush(stdout);
+	    	    buffer_message(peer, &have, sizeof(have));
+	    	}
+	    	peer = peer->next;
 	    }
 	}
 
@@ -694,14 +722,14 @@ void start_peers() {
 	int attempts=0;
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, anno);
 	while((res = curl_easy_perform(curl)) !=CURLE_OK &&
-	      attempts < 5) {
+	      attempts < MAX_CURL_ATTEMPTS) {
 	    fprintf(stderr, "curl_easy_perform() failed: %s\n",
 		    curl_easy_strerror(res));
 	    attempts++;
 	}
 	fclose(anno);
 
-	if (attempts<5) {
+	if (attempts < MAX_CURL_ATTEMPTS) {
 	    struct stat anno_stat;
 	    if(stat(tmp_file,&anno_stat)) {
 		perror("couldn't stat temporary file");
@@ -710,6 +738,11 @@ void start_peers() {
 	    // the announcement document is in /tmp/anno.tmp.
 	    // so map that into memory, then call handle_announcement on the returned pointer
 	    handle_announcement(mmap(0,anno_stat.st_size,PROT_READ,MAP_SHARED,open(tmp_file,O_RDONLY),0),anno_stat.st_size);
+	} else {
+	    // Exit
+	    curl_easy_cleanup(curl);
+	    fputs("Could not contact the tracker. Perhaps try this again.", stderr);
+	    exit(1);
 	}
 	curl_easy_cleanup(curl);
     }
@@ -825,12 +858,20 @@ int main(int argc, char** argv) {
 		if (sent_bytes < 0) {
 		    // Problem with send...
 		    // Get ridda this peer?
-		    shutdown_peer(peer);
 		    perror("send");
-		    printf("%d active peers remaining.\n",
-		    	   active_peers());
-		    fflush(stdout);
+		    /* printf("%d active peers remaining.\n", */
+		    /* 	   active_peers()); */
+		    /* fflush(stdout); */
+		    shutdown_peer(peer);
+		    peer = peer->next;
+		    continue;
+		    /* struct peer_addr peeraddr; */
+		    /* peeraddr.addr = peer->ip; */
+		    /* peeraddr.port = peer->port; */
+		    /* connect_to_peer(&peeraddr); */
 		} else {
+		    printf("Successfully send %d bytes.\n", sent_bytes);
+		    fflush(stdout);
 		    memmove(peer->outgoing, peer->outgoing+sent_bytes, peer->outgoing_count-sent_bytes);
 		    peer->outgoing_count -= sent_bytes;
 		    if (peer->outgoing_count == 0) {
