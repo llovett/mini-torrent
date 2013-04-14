@@ -131,24 +131,24 @@ int next_piece(struct peer_state *peer, int previous_piece, int *offset) {
 
     draw_state();
 
-    // Find the next piece to ask for
-    for(int i=0;i<(file_length/piece_length+1);i++) {
-	// Found a piece that is completely empty and that the peer actually has
-	if (piece_status[i].status==PIECE_EMPTY && has_piece(peer,i)) {
-	    if(debug)
-		fprintf(stderr,"Next piece %d / %d\n",i,file_length/piece_length);
-	    piece_status[i].status=PIECE_PENDING;
-	    *offset = 0;
-	    return i;
-	}
-	// Found a piece partially downloaded.
-	// Request piece starting at the last byte we received.
-	if (piece_status[i].status==PIECE_PENDING && has_piece(peer,i)) {
-	    *offset = piece_status[i].offset;
-	    return i;
+    // Find the rarest piece that we don't have
+    int i;
+    int rarest = 100000000;
+    int rarest_index = -1;
+    for (i=0; i<(file_length/piece_length+1); i++) {
+	if (piece_status[i].status == PIECE_FINISHED) continue;
+	if (piece_status[i].peer_count < rarest) {
+	    rarest = piece_status[i].peer_count;
+	    rarest_index = i;
 	}
     }
-    return -1;
+    if (piece_status[rarest_index].status == PIECE_PENDING) {
+	*offset = piece_status[i].offset;
+    } else {
+	piece_status[rarest_index].status = PIECE_PENDING;
+	*offset = 0;
+    }
+    return rarest_index;
 }
 
 /* This needs to be fixed to work properly for multi-file torrents.
@@ -586,6 +586,7 @@ void handle_message(struct peer_state *peer) {
 	    fprintf(stderr,"Have %d\n",piece_index);
 	// OR the appropriate mask byte with a byte with the appropriate single bit set
 	peer->bitfield[bitfield_byte]|=1<<bitfield_bit;
+	piece_status[piece_index].peer_count++;
 
 	send_interested(peer);
 	break;
@@ -601,6 +602,14 @@ void handle_message(struct peer_state *peer) {
 	    shutdown_peer(peer);
 	}
 	memcpy(peer->bitfield,peer->incoming+5,fieldlen);
+
+	// Note completed pieces from the bitfield and add them to our piece status array
+	int i;
+        for (i=0; i<file_length/piece_length+1; i++) {
+	    if (has_piece(peer,i)) {
+		piece_status[i].peer_count++;
+	    }
+	}
 
 	send_interested(peer);
 	break;

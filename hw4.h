@@ -24,6 +24,7 @@ struct peer_state {
 struct piece_status_t {
     enum {PIECE_EMPTY=0, PIECE_PENDING=1, PIECE_FINISHED=2} status;
     unsigned int offset;
+    int peer_count;
 } *piece_status;
 
 // Function defs
