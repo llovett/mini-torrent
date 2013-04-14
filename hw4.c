@@ -245,9 +245,11 @@ void read_block(char* data, int piece, int offset, int len) {
     int accumulated_file_length = 0;
     int block_start = piece*piece_length+offset;
 
+    // Gets the file listing
     struct bencode_list* files = (struct bencode_list*)ben_dict_get_by_str(info,"files");
     // multi-file case
     if(files) {
+	// For each file in the listing...
 	for(int i=0;i<files->n;i++) {
 	    struct bencode* file = files->values[i];
 	    struct bencode_list* path = (struct bencode_list*)ben_dict_get_by_str(file,"path");
@@ -255,7 +257,7 @@ void read_block(char* data, int piece, int offset, int len) {
 	    // accumulate a total length so we know how many pieces there are
 	    int file_length=((struct bencode_int*)ben_dict_get_by_str(file,"length"))->ll;
 
-	    printf("start %d len %d accum %d filelen %d\n",block_start,len,accumulated_file_length,file_length);
+	    printf("READING: start %d len %d accum %d filelen %d\n",block_start,len,accumulated_file_length,file_length);
 	    fflush(stdout);
 	    // at least part of the block belongs in this file
 	    if((block_start >= accumulated_file_length) && (block_start < accumulated_file_length+file_length)) {
@@ -287,17 +289,17 @@ void read_block(char* data, int piece, int offset, int len) {
 		lseek(outfile,offset_into_file,SEEK_SET);
 
 		if(remaining_file_length > len) {
-		    write(outfile,data,len);
+		    read(outfile,data,len);
 		}
 		else {
 		    if(debug) {
-			fprintf(stderr,"Uh-oh, write crossing file boundaries... watch out!\n");
+			fprintf(stderr,"Uh-oh, read crossing file boundaries... watch out!\n");
 			fprintf(stderr,"Len %d offset %d filelen %d remaining file len %d\n",len,offset_into_file,file_length,remaining_file_length);
 			fflush(stdout);
 		    }
 
-		    write(outfile,data,remaining_file_length);
-		    write_block(data+remaining_file_length,piece,offset+remaining_file_length,len-remaining_file_length);
+		    read(outfile,data,remaining_file_length);
+		    read_block(data+remaining_file_length,piece,offset+remaining_file_length,len-remaining_file_length);
 		}
 		close(outfile);
 	    }
@@ -313,9 +315,9 @@ void read_block(char* data, int piece, int offset, int len) {
 
 	    file_length = ((struct bencode_int*)ben_dict_get_by_str(info,"length"))->ll;
 
-	    // write the data to the right spot in the file
+	    // read the data from the right spot in the file
 	    lseek(outfile,piece*piece_length+offset,SEEK_SET);
-	    write(outfile, data,len);
+	    read(outfile, data,len);
 	    close(outfile);
 	}
 	else {
@@ -605,6 +607,16 @@ void handle_message(struct peer_state *peer) {
 	// REQUEST
     case 6: {
 	PRINT("Request!");
+
+	int piece_index = ntohl(*((int*)&peer->incoming[5]));
+	int piece_offset = ntohl(*((int*)&peer->incoming[9]));
+	int piece_len = ntohl(*((int*)&peer->incoming[13]));
+
+	// Buffer to contain the requested block
+	char block[piece_len];
+	read_block(block, piece_index, piece_offset, piece_len);
+	buffer_message(peer, block, piece_len);
+
 	break;
     }
 	// PIECE
