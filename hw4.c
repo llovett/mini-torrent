@@ -15,6 +15,7 @@
 #include"hw4.h"
 
 #define PRINT(x) if(debug){puts(x);fflush(stdout);}
+#define CLOSE(x) if(close(x)<0){perror("close");exit(1);}
 
 // read/write sets
 fd_set readset, writeset;
@@ -40,6 +41,17 @@ struct bencode *info;
 
 int file_length=0;
 int piece_length;
+
+int connected_peers() {
+    struct peer_state *peer = peers;
+    int count=0;
+    while(peer) {
+	if(peer->connected)
+	    count++;
+	peer = peer->next;
+    }
+    return count;
+}    
 
 int active_peers() {
     struct peer_state *peer = peers;
@@ -191,7 +203,6 @@ void write_block(char* data, int piece, int offset, int len) {
 
 		if(remaining_file_length > len) {
 		    write(outfile,data,len);
-		    close(outfile);
 		}
 		else {
 		    if(debug) {
@@ -201,22 +212,18 @@ void write_block(char* data, int piece, int offset, int len) {
 		    }
 
 		    write(outfile,data,remaining_file_length);
-		    close(outfile);
 		    write_block(data+remaining_file_length,piece,offset+remaining_file_length,len-remaining_file_length);
 		}
-
+		close(outfile);
 	    }
 	    accumulated_file_length+=file_length;
 	}
     }
     // single-file case
     else {
-
 	struct bencode_str* name = (struct bencode_str*)ben_dict_get_by_str(info,"name");
 	if(name) {
-
 	    int outfile = open(name->s,O_RDWR|O_CREAT,0777);
-
 
 	    file_length = ((struct bencode_int*)ben_dict_get_by_str(info,"length"))->ll;
 
@@ -224,8 +231,6 @@ void write_block(char* data, int piece, int offset, int len) {
 	    lseek(outfile,piece*piece_length+offset,SEEK_SET);
 	    write(outfile, data,len);
 	    close(outfile);
-
-
 	}
 	else {
 	    printf("No name?\n");
@@ -283,7 +288,6 @@ void read_block(char* data, int piece, int offset, int len) {
 
 		if(remaining_file_length > len) {
 		    write(outfile,data,len);
-		    close(outfile);
 		}
 		else {
 		    if(debug) {
@@ -293,10 +297,9 @@ void read_block(char* data, int piece, int offset, int len) {
 		    }
 
 		    write(outfile,data,remaining_file_length);
-		    close(outfile);
 		    write_block(data+remaining_file_length,piece,offset+remaining_file_length,len-remaining_file_length);
 		}
-
+		close(outfile);
 	    }
 	    accumulated_file_length+=file_length;
 	}
@@ -306,9 +309,7 @@ void read_block(char* data, int piece, int offset, int len) {
 
 	struct bencode_str* name = (struct bencode_str*)ben_dict_get_by_str(info,"name");
 	if(name) {
-
 	    int outfile = open(name->s,O_RDWR|O_CREAT,0777);
-
 
 	    file_length = ((struct bencode_int*)ben_dict_get_by_str(info,"length"))->ll;
 
@@ -316,8 +317,6 @@ void read_block(char* data, int piece, int offset, int len) {
 	    lseek(outfile,piece*piece_length+offset,SEEK_SET);
 	    write(outfile, data,len);
 	    close(outfile);
-
-
 	}
 	else {
 	    printf("No name?\n");
@@ -361,8 +360,7 @@ void drop_message(struct peer_state* peer) {
     int msglen = ntohl(((int*)peer->incoming)[0]); // size of length prefix is not part of the length
     if(peer->count<msglen+4) {
 	fprintf(stderr,"Trying to drop %d bytes, we have %d!\n",msglen+4,peer->count);
-	peer->connected=0;
-	exit(1);
+	shutdown_peer(peer);
     }
     peer->count -= msglen+4; // size of length prefix is not part of the length
     if(peer->count) {
@@ -419,7 +417,7 @@ void shutdown_peer(struct peer_state *peer) {
     peer->connected = 0;
     FD_CLR(peer->socket, &readset);
     FD_CLR(peer->socket, &writeset);
-    close(peer->socket);
+    CLOSE(peer->socket);
 }
 
 void connect_to_peer(struct peer_addr *peeraddr) {
@@ -433,7 +431,7 @@ void connect_to_peer(struct peer_addr *peeraddr) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) {
 	perror("socket");
-	exit(1);
+	return;
     }
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
@@ -448,14 +446,21 @@ void connect_to_peer(struct peer_addr *peeraddr) {
 	perror("setsockopt");
 	fprintf(stderr, "Failed trying to connect to socket %d.\n", s);
 	fflush(stderr);
+	CLOSE(s);
 	return;
     }
 
     int res = connect(s, (struct sockaddr*)&addr, sizeof(addr));
     if(res == -1) {
-	fprintf(stderr,"Couldn't connect to %hu \n", peeraddr->port);
+	struct in_addr inaddr;
+	inaddr.s_addr = peeraddr->addr;
+	fprintf(stderr,"Couldn't connect to IP(%s) PORT(%hu) SOCKET(%d) \n",
+		inet_ntoa(inaddr),
+		peeraddr->port,
+		s);
 	fflush(stderr);
 	perror("Error while connecting.");
+	CLOSE(s);
 	return;
     }
 
@@ -537,6 +542,8 @@ void handle_message(struct peer_state *peer) {
 	if(debug)
 	    fprintf(stderr,"Choke\n");
 	peer->choked = 1;
+	// This doesn't take into account that the piece may have been partially
+	// complete already...
 	piece_status[peer->requested_piece].status=PIECE_EMPTY;
 	peer->requested_piece = -1;
 	break;
@@ -620,6 +627,19 @@ void handle_message(struct peer_state *peer) {
 
 	    peer->requested_piece=next_piece(peer, piece, &offset);
 
+	    // Shutdown peers we don't need
+	    if (peer->requested_piece == -1) {
+		fprintf(stderr, "No more pieces to download!\n");
+		fflush(stderr);
+		// don't exit if some piece is still being downloaded
+		for(int i=0;i<file_length/piece_length+1;i++) {
+		    if(piece_status[i].status!=2) {
+			shutdown_peer(peer);
+			break;
+		    }
+		}
+	    }
+
 	    // Send HAVE messages to each of our connected peers for this piece
 	    struct {
 	    	int len;
@@ -635,7 +655,8 @@ void handle_message(struct peer_state *peer) {
 	    	    printf("Sent >>> HAVE(%d) to PEER_SOCKET(%d)\n",
 	    		   piece, peer->socket);
 	    	    fflush(stdout);
-	    	    buffer_message(peer, &have, sizeof(have));
+		    send(peer->socket, &have, sizeof(have), 0);
+	    	    /* buffer_message(peer, &have, sizeof(have)); */
 	    	}
 	    	peer = peer->next;
 	    }
@@ -737,7 +758,13 @@ void start_peers() {
 	    }
 	    // the announcement document is in /tmp/anno.tmp.
 	    // so map that into memory, then call handle_announcement on the returned pointer
-	    handle_announcement(mmap(0,anno_stat.st_size,PROT_READ,MAP_SHARED,open(tmp_file,O_RDONLY),0),anno_stat.st_size);
+	    int tmpfile = open(tmp_file,O_RDONLY);
+	    if (-1 == tmpfile) {
+		perror("open");
+		exit(1);
+	    }
+	    handle_announcement(mmap(0,anno_stat.st_size,PROT_READ,MAP_SHARED,tmpfile,0),anno_stat.st_size);
+	    CLOSE(tmpfile);
 	} else {
 	    // Exit
 	    curl_easy_cleanup(curl);
@@ -774,6 +801,7 @@ int main(int argc, char** argv) {
 	perror("couldn't mmap file");
 	exit(1);
     }
+    close(fd);
     size_t off = 0;
     int error = 0;
     torrent = (struct bencode_dict*)ben_decode2(buf,file_stat.st_size,&off,&error);
@@ -859,16 +887,9 @@ int main(int argc, char** argv) {
 		    // Problem with send...
 		    // Get ridda this peer?
 		    perror("send");
-		    /* printf("%d active peers remaining.\n", */
-		    /* 	   active_peers()); */
-		    /* fflush(stdout); */
 		    shutdown_peer(peer);
 		    peer = peer->next;
 		    continue;
-		    /* struct peer_addr peeraddr; */
-		    /* peeraddr.addr = peer->ip; */
-		    /* peeraddr.port = peer->port; */
-		    /* connect_to_peer(&peeraddr); */
 		} else {
 		    printf("Successfully send %d bytes.\n", sent_bytes);
 		    fflush(stdout);
@@ -892,16 +913,21 @@ int main(int argc, char** argv) {
 
 	// wait for a signal that all the downloading is done
 	if (missing_blocks()>0) {
-	    if(active_peers()==0 && missing_blocks()>0) {
+	    if(connected_peers()==0 && missing_blocks()>0) {
 		printf("Ran out of active peers, reconnecting.\n");
 		start_peers();
+	    } else if (active_peers()==0 && missing_blocks()>0) {
+		// Poke some peers
+		for (struct peer_state *peer=peers; peer; peer=peer->next) {
+		    if (peer->connected && peer->choked)
+			send_interested(peer);
+		}
 	    }
 	} else {
 	    puts("Download complete");
 	    break;
 	}
     }
-
     return 0;
 }
 
