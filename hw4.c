@@ -12,10 +12,10 @@
 #include<curl/curl.h>
 #include<arpa/inet.h>
 #include<netinet/in.h>
+#include<time.h>
 #include"hw4.h"
 
 #define PRINT(x) if(debug){puts(x);fflush(stdout);}
-#define CLOSE(x) if(close(x)<0){perror("close");exit(1);}
 
 // read/write sets
 fd_set readset, writeset;
@@ -417,7 +417,7 @@ void shutdown_peer(struct peer_state *peer) {
     peer->connected = 0;
     FD_CLR(peer->socket, &readset);
     FD_CLR(peer->socket, &writeset);
-    CLOSE(peer->socket);
+    close(peer->socket);
 }
 
 void connect_to_peer(struct peer_addr *peeraddr) {
@@ -446,7 +446,7 @@ void connect_to_peer(struct peer_addr *peeraddr) {
 	perror("setsockopt");
 	fprintf(stderr, "Failed trying to connect to socket %d.\n", s);
 	fflush(stderr);
-	CLOSE(s);
+	close(s);
 	return;
     }
 
@@ -460,7 +460,7 @@ void connect_to_peer(struct peer_addr *peeraddr) {
 		s);
 	fflush(stderr);
 	perror("Error while connecting.");
-	CLOSE(s);
+	close(s);
 	return;
     }
 
@@ -655,8 +655,8 @@ void handle_message(struct peer_state *peer) {
 	    	    printf("Sent >>> HAVE(%d) to PEER_SOCKET(%d)\n",
 	    		   piece, peer->socket);
 	    	    fflush(stdout);
-		    send(peer->socket, &have, sizeof(have), 0);
-	    	    /* buffer_message(peer, &have, sizeof(have)); */
+		    /* send(peer->socket, &have, sizeof(have), 0); */
+	    	    buffer_message(peer, &have, sizeof(have));
 	    	}
 	    	peer = peer->next;
 	    }
@@ -727,6 +727,11 @@ void start_peers() {
     CURL *curl;
     CURLcode res;
 
+    // Make sure all peers have their sockets closed...
+    for (struct peer_state *peer = peers; peer; peer=peer->next) {
+	shutdown_peer(peer);
+    }
+
     curl = curl_easy_init();
     if(curl) {
 	curl_easy_setopt(curl, CURLOPT_URL, announce_url);
@@ -764,7 +769,7 @@ void start_peers() {
 		exit(1);
 	    }
 	    handle_announcement(mmap(0,anno_stat.st_size,PROT_READ,MAP_SHARED,tmpfile,0),anno_stat.st_size);
-	    CLOSE(tmpfile);
+	    close(tmpfile);
 	} else {
 	    // Exit
 	    curl_easy_cleanup(curl);
@@ -772,6 +777,12 @@ void start_peers() {
 	    exit(1);
 	}
 	curl_easy_cleanup(curl);
+    }
+
+    // Add all peers to the read set
+    for (struct peer_state *peer = peers; peer && (!peer->rcv_handshake || peer->connected);
+	 peer=peer->next) {
+	FD_SET(peer->socket, &readset);
     }
 }
 
@@ -859,10 +870,6 @@ int main(int argc, char** argv) {
 
     // Find peers from the tracker
     start_peers();
-    // Add all peers to global read set
-    for (struct peer_state *peer=peers; peer; peer=peer->next) {
-	FD_SET(peer->socket, &readset);
-    }
 
     // Select loop
     while (1) {
@@ -871,8 +878,7 @@ int main(int argc, char** argv) {
 	memcpy(&wtemp, &writeset, sizeof(fd_set));
 
 	int selected = select(FD_SETSIZE, &rtemp, &wtemp, NULL, 0);
-	// If we time out, try reconnecting to the peers
-	    
+	
 	if (selected < 0) {
 	    perror("select");
 	}
@@ -891,8 +897,6 @@ int main(int argc, char** argv) {
 		    peer = peer->next;
 		    continue;
 		} else {
-		    printf("Successfully send %d bytes.\n", sent_bytes);
-		    fflush(stdout);
 		    memmove(peer->outgoing, peer->outgoing+sent_bytes, peer->outgoing_count-sent_bytes);
 		    peer->outgoing_count -= sent_bytes;
 		    if (peer->outgoing_count == 0) {
