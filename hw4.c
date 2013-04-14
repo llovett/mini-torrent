@@ -26,7 +26,7 @@ char announce_url[255];
 #define BUFSIZE piece_length*2-1
 struct peer_state *peers=0;
 
-int debug=1;  //set this to zero if you don't want all the debugging messages
+int debug=0;  //set this to zero if you don't want all the debugging messages
 
 char screenbuf[10000];
 
@@ -541,8 +541,10 @@ void handle_message(struct peer_state *peer) {
     switch(peer->incoming[4]) {
 	// CHOKE
     case 0: {
-	if(debug)
-	    fprintf(stderr,"Choke\n");
+	
+	puts("CHOKED by peer. Please wait for UNCHOKE.");
+	fflush(stdout);
+
 	peer->choked = 1;
 	// This doesn't take into account that the piece may have been partially
 	// complete already...
@@ -672,9 +674,6 @@ void handle_message(struct peer_state *peer) {
 	    struct peer_state *peer = peers;
 	    while (peer) {
 	    	if (peer->connected && !peer->choked) {
-	    	    printf("Sent >>> HAVE(%d) to PEER_SOCKET(%d)\n",
-	    		   piece, peer->socket);
-	    	    fflush(stdout);
 	    	    buffer_message(peer, &have, sizeof(have));
 	    	}
 	    	peer = peer->next;
@@ -911,7 +910,6 @@ int main(int argc, char** argv) {
 		if (sent_bytes < 0) {
 		    // Problem with send...
 		    // Get ridda this peer?
-		    perror("send");
 		    shutdown_peer(peer);
 		    peer = peer->next;
 		    continue;
@@ -953,4 +951,3 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
-
