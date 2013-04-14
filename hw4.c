@@ -564,16 +564,15 @@ void handle_message(struct peer_state *peer) {
     case 2: {
 	PRINT("Interested!");
 
-	// TODO:send an unchoke message:
-	/*
-	 *  struct {
-	 *    int len;
-	 *    char id;
-	 *  } __attribute__((packed)) msg;
-	 *  msg.len = htonl(1);
-	 *  msg.id = 1;
-	 *
-	 **/ 
+	// Send an unchoke message
+	struct {
+	    int len;
+	    char id;
+	} __attribute__((packed)) msg;
+	msg.len = htonl(1);
+	msg.id = 1;
+	buffer_message(peer, &msg, sizeof(msg));
+	
 	break;
     }
 	// HAVE -- update the bitfield for this peer
@@ -655,7 +654,6 @@ void handle_message(struct peer_state *peer) {
 	    	    printf("Sent >>> HAVE(%d) to PEER_SOCKET(%d)\n",
 	    		   piece, peer->socket);
 	    	    fflush(stdout);
-		    /* send(peer->socket, &have, sizeof(have), 0); */
 	    	    buffer_message(peer, &have, sizeof(have));
 	    	}
 	    	peer = peer->next;
